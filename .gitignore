@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.env.local
+*.key
+*.pem
+
+# Runtime state
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/cache/
+logs/
+*.log
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

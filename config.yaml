@@ -1,0 +1,236 @@
+# gate-extreme-bot configuration
+# Credentials live in .env, never here.
+# Every threshold below is enforced fail-closed: missing/invalid -> refuse to trade.
+
+mode: scalp                    # scalp | breakout
+
+settle: usdt
+dry_run: true                  # overridden only by DRY_RUN=false in .env AND --confirm-live
+
+leverage:
+  minimum: 100                 # pairs whose leverage_max < this are SKIPPED entirely
+  default: 100                 # exchange leverage setting (isolated)
+  margin_mode: isolated
+  # DECISION (user, 2026-08-09): pure 100x. No margin top-up. Effective leverage == default.
+  # Consequence, verified live: at 100x with protection.liquidation_buffer=0.005, only contracts
+  # with maintenance_rate 0.30% (BTC_USDT, ETH_USDT) can ever pass the liquidation guard.
+  # The other 29 pairs at >=100x all have mmr 0.50% -> liq distance 0.425% < 0.5% buffer -> no
+  # stop-loss fits, so they are skipped on every evaluation. See docs/ARCHITECTURE.md §4.
+  allow_margin_topup: false
+  max_effective_leverage: 100
+
+risk:
+  per_trade: 0.0025            # 0.25% of equity risked per trade
+  max_daily_loss: 0.01         # 1%  -> STOP TRADING for the day
+  max_drawdown: 0.03           # 3%  -> STOP TRADING, requires manual reset
+  max_consecutive_losses: 3    #     -> STOP TRADING
+  max_open_positions: 1
+  # Explicitly disabled. Not configurable on purpose.
+  martingale: false
+  averaging_down: false
+
+strategy:
+  minimum_score: 80            # 0-100; below this -> DO NOTHING
+  minimum_rr: 2
+  timeframes: [1m, 5m, 15m, 1h]
+  scoring_weights:             # must sum to 100
+    trend: 25
+    momentum: 20
+    volume: 15
+    price_action: 20
+    volatility: 10
+    support_resistance: 10
+  regime:
+    require_clear_regime: true  # ambiguous regime -> SKIP
+    scalp_allowed:    [TRENDING, RANGING]
+    breakout_allowed: [BREAKOUT, BREAKDOWN]
+
+protection:
+  # DECISION (user, 2026-08-09): lowered 0.50% -> 0.30% so the mmr-0.50% contracts become tradable.
+  # Verified live at 100x:  mmr 0.30% (BTC, ETH)   -> liq 0.625% -> max SL 0.325%
+  #                         mmr 0.50% (29 others)  -> liq 0.425% -> max SL 0.125%
+  # All 31 pairs at >=100x now pass the guard, including SOL and XRP.
+  # Accepted cost: less room between stop and liquidation. A sharp mark-price spike is now more
+  # likely to reach liq_price before the stop fills. This buffer is protection, not immunity.
+  liquidation_buffer: 0.003    # 0.30% minimum gap between SL and liquidation price
+  verify_liq_price: true       # re-read liq_price from exchange after fill; mismatch -> flatten
+  move_to_breakeven: true
+  breakeven_trigger_r: 1.0     # move SL to BE once +1R
+  breakeven_fee_buffer: 0.0009 # ~0.085% round-trip fee + slippage pad, so BE is truly break-even
+  trailing_stop: true
+  trailing_atr_multiplier: 1.5
+  sl_price_type: mark          # mark | last | index — mark, because liquidation uses mark price
+  emergency_close_on_sl_failure: true
+  sl_retry_attempts: 3
+  dead_man_switch_seconds: 60  # countdown_cancel_all; bot crash must not leave naked orders
+
+stop_loss:
+  method: auto                 # auto | atr | structure  (auto = wider of the two, then capped)
+  atr_period: 14
+  atr_multiplier: 1.5
+  # Hard ceiling per contract = liq_distance - liquidation_buffer, resolved at runtime from the
+  # contract's tiered maintenance_rate. At 100x with a 0.30% buffer that is:
+  #   mmr 0.30% (BTC, ETH)  -> 0.325%   mmr 0.50% (29 others) -> 0.125%
+  # min_distance admits the tighter of the two. A 0.125% stop is noise-width on 1m: expect
+  # frequent stop-outs on the mmr-0.50% pairs, and rely on min_sl_atr_ratio to reject the worst.
+  min_distance: 0.001          # 0.10%
+  max_distance: 0.02           # 2%
+  structure_lookback: 50
+  # ATR/structure SL will almost always be wider than the 0.125% ceiling at 100x.
+  # cap  = clamp the SL to the ceiling and take the trade (matches the chosen 100x-pure profile)
+  # skip = refuse the trade whenever ATR/structure demands more room than the buffer allows
+  on_sl_exceeds_max: cap
+  # Guard against the degenerate case: if the capped SL is tighter than this multiple of
+  # recent 1m ATR, the stop is inside pure noise and the trade is skipped regardless.
+  min_sl_atr_ratio: 0.20
+
+take_profit:
+  tp1_r: 1.0
+  tp1_close_pct: 0.40
+  tp2_r: 2.0
+  tp2_close_pct: 0.35
+  tp3_r: 3.0                   # remainder rides the ATR trailing stop
+  # MANDATORY at pure 100x, not a preference. With a 0.125% stop, a taker entry costs 1.20R in
+  # fees (break-even WR 73.3%); a post-only entry costs 0.52R (break-even WR 50.7%).
+  # Validation rejects tif=ioc while leverage.default >= 100.
+  entry_tif: poc               # post-only: maker fee is -0.01%, a rebate. See ARCHITECTURE.md §5.
+  entry_fill_timeout_seconds: 20  # unfilled post-only entry -> cancel, no trade, not an error
+
+filters:
+  btc_volatility_filter: true
+  btc_symbol: BTC_USDT
+  btc_max_1m_move: 0.004       # 0.4% in one 1m candle -> suspend alt entries
+  btc_max_5m_move: 0.010
+  btc_volume_spike_multiple: 4.0
+  btc_suspend_seconds: 300
+
+  max_spread: 0.0004           # 0.04% of mid
+  max_slippage: 0.0005
+  min_book_depth_usdt: 50000   # within the slippage band, on the side we must cross
+  min_24h_volume_usdt: 20000000
+  abnormal_candle_atr_multiple: 3.0   # do not enter right after a 3x ATR candle
+  cooldown_after_loss_seconds: 300
+  cooldown_after_win_seconds: 60
+
+universe:
+  # DECISION (user, 2026-08-09): all 31 contracts with leverage_max >= 100 (verified live).
+  # With liquidation_buffer at 0.30%, ALL 31 now pass the guard at 100x:
+  #   mmr 0.30% (BTC, ETH)  -> max SL 0.325%,  fee 0.20R, break-even WR 40.0%
+  #   mmr 0.50% (29 others) -> max SL 0.125%,  fee 0.52R, break-even WR 50.7%
+  # The mmr-0.50% pairs are materially harder: half the stop room and 2.6x the fee drag.
+  auto_discover: true          # scan /contracts and keep those meeting leverage.minimum
+  exclude_synthetics: false
+  symbols:
+    # crypto 24/7, mmr 0.30% — the only pairs tradable at pure 100x
+    - BTC_USDT
+    - ETH_USDT
+    # crypto 24/7, mmr 0.50%
+    - SOL_USDT
+    - XRP_USDT
+    # metals / energy
+    - XAU_USDT
+    - XAG_USDT
+    - XPT_USDT
+    - XPD_USDT
+    - XCU_USDT
+    - CL_USDT
+    - BZ_USDT
+    - NG_USDT
+    - PAXG_USDT
+    - XAUT_USDT
+    # tokenized equities
+    - AAPLX_USDT
+    - AMZNX_USDT
+    - GOOGLX_USDT
+    - METAX_USDT
+    - MSFT_USDT
+    - NVDAX_USDT
+    - TSLAX_USDT
+    - TSM_USDT
+    - SPCX_USDT
+    # indices
+    - SPX500_USDT
+    - NAS100_USDT
+    - US30_USDT
+    - UK100_USDT
+    - HK50_USDT
+    - JPN225_USDT
+    # FX
+    - EURUSD_USDT
+    - GBPUSD_USDT
+
+# Required because non-24/7 synthetics are now in the universe. A weekend or overnight gap at
+# 100x jumps straight past a 0.125% stop: the SL cannot execute while the venue is closed, so the
+# loss is bounded by liquidation instead of by the stop. Risk-per-trade does not hold across a gap.
+session_guard:
+  enabled: true
+  flat_before_close_minutes: 30    # force-close synthetics before the session ends
+  no_entry_before_close_minutes: 60
+  no_entry_after_open_minutes: 15  # opening auctions gap and widen spreads violently
+  treat_unknown_session_as_closed: true  # fail closed when the calendar is unavailable
+
+execution:
+  rate_limit_per_second: 8
+  request_timeout_seconds: 10
+  max_retries: 4
+  backoff_base_seconds: 0.5
+  backoff_max_seconds: 8
+
+# PHASE 3. Live-verified against wss://fx-ws.gateio.ws/v4/ws/usdt on 2026-08-09.
+websocket:
+  url: wss://fx-ws.gateio.ws/v4/ws/usdt
+  connect_timeout_seconds: 15
+  ping_interval_seconds: 5      # matches the official SDK default
+  # No pong within this long -> the link is dead even if the socket looks open.
+  pong_timeout_seconds: 15
+
+  # Staleness watchdog. The feed is only usable while updates keep arriving; past these
+  # thresholds the layer reports NOT healthy and refuses to serve prices, so no signal can
+  # be produced from stale data. Fail-closed: unknown/never-received counts as stale.
+  staleness:
+    ticker_seconds: 10          # tickers update ~1/s per contract
+    book_seconds: 5             # book_ticker updates on every top-of-book change
+    # Grace after (re)connect before staleness is judged — avoids a false stale trip
+    # during the initial subscribe/snapshot burst.
+    warmup_seconds: 10
+
+  reconnect:
+    base_delay_seconds: 1.0
+    max_delay_seconds: 60.0
+    jitter_ratio: 0.25          # same jitter policy as the REST client
+    # Reconnect storms are themselves a failure mode: too many attempts in a short
+    # window means something is wrong that reconnecting will not fix.
+    max_attempts_per_window: 10
+    window_seconds: 300
+
+  # After ANY reconnect, WebSocket state is discarded and rebuilt from REST.
+  # WS is never treated as source of truth across a disconnect.
+  resync:
+    require_rest_resync: true   # cannot be disabled; validation enforces it
+    reconcile_positions: true
+    reconcile_open_orders: true
+    reconcile_price_orders: true  # the protective SL/TP orders
+    max_attempts: 3
+
+backtest:
+  fee_taker: 0.00075           # live-verified
+  fee_maker: -0.0001           # live-verified: a rebate
+  slippage_model: book         # book | fixed
+  fixed_slippage: 0.0003
+  simulate_liquidation: true
+  simulate_funding: true
+  min_trades_for_verdict: 1000
+  walk_forward:
+    train_pct: 0.5
+    validation_pct: 0.25
+    test_pct: 0.25
+
+database:
+  path: data/trades.db
+  wal: true
+
+logging:
+  level: INFO
+  file: logs/bot.log
+  json: true
+  redact_secrets: true
