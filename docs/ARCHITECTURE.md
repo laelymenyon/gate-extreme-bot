@@ -511,4 +511,92 @@ and the tier-bypass guards.
 **No order was sent in this phase.** The write-guard blocked nothing because nothing was
 attempted; the feed is read-only by construction and has no order-placing path.
 
-**Next: PHASE 4 — indicators.** Not started; awaiting go-ahead.
+## 11. PHASE 4 — indicators (`strategy/indicators.py`)
+
+Pure numpy, no TA-Lib (rejected in Phase 1 for needing a system C library). Nothing in this
+module decides anything: no signals, no scoring, no thresholds. Those are Phase 5.
+
+### Conventions, chosen so backtest and live share one code path
+
+- **Length-preserving.** Output index *i* always corresponds to bar *i*; nothing is re-aligned
+  downstream.
+- **NaN means "not enough data", never a number.** Insufficient history yields an all-NaN array
+  rather than a partially-warmed value — the same fail-closed rule the market-data feed uses.
+- **Pure functions.** No I/O, no config, no state.
+- **Wilder smoothing** for RSI and ATR, **SMA-seeded EMA** for EMA/MACD, so an EMA 200 here
+  matches a 200 EMA on the chart instead of drifting for hundreds of bars.
+
+`Candles.from_gate()` parses the `/candlesticks` payload as-is — string prices, contract volume
+in `v`, settle turnover in `sum`. It does **not** drop the in-progress final bar: whether to use a
+forming bar is a strategy decision, not an indicator one.
+
+### Relative volume excludes the current bar from its own baseline
+
+`relative_volume` divides a bar's volume by the average of the `period` bars **before** it, not
+by an average that contains it. The inclusive form dilutes exactly the spike it is meant to
+measure:
+
+| definition | a true 4x bar reads | bar needed to read 4.0 | ceiling at period=20 |
+|---|---|---|---|
+| inclusive (bar in its own average) | 3.48x | 4.75x | 20.0 |
+| **exclusive (current)** | **4.00x** | **4.0x** | unbounded |
+
+`filters.btc_volume_spike_multiple: 4.0` is written in the intuitive unit — "this bar is 4x
+normal". Under the inclusive form that filter needs a 4.75x bar before it suspends alt entries,
+so a protective filter fires late or not at all. First valid index is `period`, not `period - 1`,
+because the baseline needs `period` prior bars.
+
+### Support / resistance — the lookahead guard
+
+`swing_highs`/`swing_lows` mark strict local extremes: strictly greater (or less) than all `left`
+bars before and all `right` bars after. Equality is ambiguous, so a plateau of equal highs yields
+**no** pivot rather than turning one flat top into two levels a tick apart. NaN bars compare
+False and are never pivots.
+
+A pivot at bar *i* is only **knowable** at bar `i + right`. `nearest_support`/`nearest_resistance`
+enforce that delay: a pivot is ineligible until its confirmation bar, and only pivots within
+`lookback` bars count (`stop_loss.structure_lookback: 50`). This is the classic backtest
+lookahead bug — levels that were not yet discoverable make a strategy look prescient in replay
+and fall apart live — and because backtest and live share this code path the guard has to live
+in the indicator, not in the caller.
+
+`test_as_of_equals_replaying_on_a_truncated_series` pins it from both directions: what live sees
+(`values[:i+1]`) must equal what a backtest sees (`as_of=i` on the full array) at every bar. The
+same audit was run against 300 live BTC_USDT 1m candles — **0 mismatches**.
+
+Both functions return **NaN when no level is found**, which a caller sizing a structure stop must
+treat as missing data and fall back, never as open space.
+
+### Verified against live BTC_USDT 1m candles (300 bars, 2026-08-09)
+
+| Indicator | Value | Sanity |
+|---|---|---|
+| EMA 9 / EMA 200 | 65002.12 / 65151.04 | fast below slow — consistent with the down leg |
+| RSI 14 | 31.59 | in range, near oversold |
+| ATR 14 | 30.58 = **0.047 % of price** | see below |
+| MACD / histogram | −56.57 / +1.62 | negative line, histogram turning up |
+| VWAP (anchored) | 65213.96 | above last close 64994.8 |
+| nearest support / resistance | 64974.9 / 65013.7 | brackets the close |
+
+**The ATR reading matters for Phase 5.** At `stop_loss.atr_multiplier: 1.5`, an ATR of 0.047 %
+gives an ATR stop of **0.071 %** — *tighter* than the 0.325 % ceiling BTC/ETH have at 100x, so in
+this volatility regime `on_sl_exceeds_max: cap` will not bind on BTC. But it is also below
+`stop_loss.min_distance: 0.001` (0.10 %), which would floor it back up to 0.10 %. And
+`min_sl_atr_ratio: 0.20` compares the final stop to ATR: 0.10 % / 0.047 % = 2.1x, which passes.
+The interaction of the ATR stop, the min-distance floor, and the per-contract ceiling is a Phase 5
+question; this phase only establishes that the numbers feeding it are real.
+
+### Tests
+
+122 indicator tests, 293 total, no network. Reference values are recomputed independently inside
+the tests — hand-rolled Wilder and EMA recurrences, closed-form VWAP cases — so a bug in
+`indicators.py` cannot make its own test pass. Coverage: length preservation and all-NaN warm-up
+for every function, first-valid-index for each, EMA SMA-seeding, RSI boundary conventions
+(100/0/flat-is-50) and off-by-one alignment, MACD signal seeded only from valid MACD values,
+true-range gap terms in both directions, ATR Wilder recurrence, VWAP invariance to the contract
+multiplier, rolling-vs-anchored VWAP divergence, relative-volume exclusivity and its unbounded
+ceiling, pivot plateau/NaN/edge handling, and the confirmation-delay and backtest-parity guards.
+
+**No order was sent in this phase.** The module has no network path and no order-placing path.
+
+**Next: PHASE 5 — regime, scoring, signal engine.** Not started; awaiting go-ahead.

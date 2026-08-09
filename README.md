@@ -3,7 +3,8 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 1 of 14 complete.** Environment, verified API facts, and architecture only.
+> **Status: PHASE 4 of 14 complete.** Environment, REST client, market-data feed, indicators.
+> No trading logic yet — signals, scoring, and risk begin in Phase 5.
 > No trading logic exists yet. Nothing in this repo can place an order.
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
@@ -157,6 +158,37 @@ resolves the real tier from REST. Live check: 100k notional → tier 1 mmr 0.003
 
 171 tests. No order was sent — the feed is read-only by construction.
 
+## What Phase 4 added — indicators
+
+`strategy/indicators.py`, pure numpy (TA-Lib was rejected in Phase 1 for needing a system C
+library). EMA 9/21/50/200, RSI, MACD, true range, ATR, anchored and rolling VWAP, volume MA,
+relative volume, swing pivots and nearest support/resistance.
+
+Every function is length-preserving, pure, and returns **NaN for "not enough data" rather than a
+half-warmed number** — the same fail-closed rule the feed uses. RSI and ATR use Wilder smoothing,
+EMA and MACD are SMA-seeded, so an EMA 200 here matches a 200 EMA on the chart.
+
+Two decisions worth calling out:
+
+**Relative volume excludes the current bar from its own baseline.** An inclusive average dilutes
+the spike it measures: a true 4x bar reads 3.48x, and `filters.btc_volume_spike_multiple: 4.0`
+would need a 4.75x bar before suspending alt entries. Excluded, a 4x bar reads 4.0.
+
+**Support/resistance will not use a pivot before its confirmation bar.** A swing high at bar *i*
+is only knowable at `i + right`. Reading it earlier is the classic backtest lookahead bug, and
+since backtest and live share this code path the guard lives in the indicator. A test asserts
+that what live sees (`values[:i+1]`) equals what a backtest sees (`as_of=i`) at every bar; the
+same audit against 300 live BTC 1m candles found 0 mismatches. No level found returns NaN, which
+callers must treat as missing data, not as open space.
+
+Live check on 300 BTC_USDT 1m candles: RSI 31.59, ATR 14 = 0.047 % of price, MACD −56.57 with the
+histogram turning up, support/resistance bracketing the close. That ATR is the number Phase 5
+inherits — at `atr_multiplier: 1.5` it implies a 0.071 % stop, below the 0.10 % `min_distance`
+floor and well inside BTC's 0.325 % ceiling at 100x.
+
+122 indicator tests, 293 total. Reference values are recomputed independently inside the tests,
+so a bug in `indicators.py` cannot make its own test pass.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -182,7 +214,7 @@ execution/  order_manager.py  protection.py
 backtest/   engine.py
 database/   models.py
 monitoring/ logger.py  dashboard.py
-tests/      test_config.py  test_gate_client.py
+tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -193,8 +225,8 @@ docs/       ARCHITECTURE.md
 | 1 | Environment + architecture | **done** |
 | 2 | Gate.io REST client (signing, backoff, idempotency) | **done** |
 | 3 | Market data + WebSocket (feed, watchdog, REST resync) | **done** |
-| 4 | Indicators | next |
-| 5 | Signal scoring | pending |
+| 4 | Indicators | **done** |
+| 5 | Signal scoring | next |
 | 6 | Risk manager | pending |
 | 7 | Liquidation protection | pending |
 | 8 | Paper trading | pending |
