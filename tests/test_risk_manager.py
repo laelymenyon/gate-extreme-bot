@@ -530,16 +530,20 @@ def test_the_manager_cannot_place_or_close_anything():
 def test_the_next_phase_has_not_started():
     """The moving boundary marker: what is built, and what is still a stub.
 
-    It has named the liquidation guard, then execution, then the backtester as each
-    landed; it now names the database and dashboard. Live orders still require all three
-    safety switches, and the execution layer defaults to simulation.
+    It has named the liquidation guard, then execution, then the backtester, then the
+    database as each landed. Phase 11 was the last stub, so every module now imports and
+    the remaining phases are validation rather than new layers. Live orders still require
+    all three safety switches, and the execution layer defaults to simulation.
     """
     for built in ("risk.liquidation_guard", "execution.order_manager",
-                  "execution.protection", "backtest.engine"):
+                  "execution.protection", "backtest.engine", "paper.loop",
+                  "database.models", "monitoring.dashboard", "monitoring.logger"):
         importlib.import_module(built)
-    for pending in ("database.models", "monitoring.dashboard"):
-        with pytest.raises(NotImplementedError):
-            importlib.import_module(pending)
+
+    # The property that outlives the stubs: nothing trades without all three switches.
+    from config import load_config
+
+    assert load_config().live_enabled is False
 
 
 def test_every_refusal_names_a_breaker_and_explains_itself():

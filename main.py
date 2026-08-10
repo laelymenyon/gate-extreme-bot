@@ -29,7 +29,7 @@ PHASES = [
     ("8",  "Order execution",             True),
     ("9",  "Backtesting",                  True),
     ("10", "Paper trading loop",          True),
-    ("11", "Dashboard + database",         False),
+    ("11", "Dashboard + database",         True),
     ("12", "Testing",                      False),
     ("13", "Paper trading validation",     False),
     ("14", "Live readiness",               False),
@@ -121,6 +121,18 @@ async def show_positions(cfg) -> int:
     return 0
 
 
+def show_stats(cfg) -> str:
+    """Render the Phase 11 dashboard over whatever history the database holds."""
+    from database.models import TradeStore
+    from monitoring.dashboard import Dashboard
+
+    store = TradeStore.from_config(cfg)
+    if store.count() == 0:
+        return (f"No trades recorded yet in {store.path}. Paper or backtest runs write "
+                "their history here; analytics appear once they have.")
+    return Dashboard.from_config(cfg, store).render()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -136,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.positions:
             exit_code = asyncio.run(show_positions(cfg))
         if args.stats:
-            print("\n--stats: requires Phase 11 (database + analytics). Not implemented yet.")
+            print()
+            print(show_stats(cfg))
         return exit_code
 
     print_status(cfg)
@@ -154,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         print("construct while the safety gate is open, and it only ever uses the "
               "in-process simulator.")
     else:
-        print(f"\nPhases 1-10 complete. The '{args.mode}' engine arrives in a later "
+        print(f"\nPhases 1-11 complete. The '{args.mode}' engine arrives in a later "
               "phase; nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0
