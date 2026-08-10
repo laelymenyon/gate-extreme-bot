@@ -166,6 +166,67 @@ def _validate(cfg: Config) -> None:
     if cfg.get("strategy.minimum_rr") < 1:
         raise ConfigError("strategy.minimum_rr must be >= 1")
 
+    # --- PHASE 5: multi-timeframe wiring ----------------------------------
+    timeframes = cfg.get("strategy.timeframes")
+    if not isinstance(timeframes, list) or not timeframes:
+        raise ConfigError("strategy.timeframes must be a non-empty list")
+
+    tf_weights = cfg.get("strategy.timeframe_weights", None)
+    if tf_weights is not None:
+        if not isinstance(tf_weights, dict):
+            raise ConfigError("strategy.timeframe_weights must be a mapping")
+        missing = [t for t in timeframes if t not in tf_weights]
+        if missing:
+            raise ConfigError(
+                f"strategy.timeframe_weights is missing {missing}; every timeframe in "
+                "strategy.timeframes needs a weight or its score would be dropped "
+                "silently from the blend"
+            )
+        total = sum(float(tf_weights[t]) for t in timeframes)
+        if abs(total - 1.0) > 1e-9:
+            raise ConfigError(
+                f"strategy.timeframe_weights over strategy.timeframes must sum to 1.0, "
+                f"got {total}"
+            )
+
+    # A veto timeframe that is not evaluated cannot veto anything: the higher-timeframe
+    # check would silently pass and the safety property would be gone.
+    for veto in cfg.get("strategy.veto_timeframes", []):
+        if veto not in timeframes:
+            raise ConfigError(
+                f"strategy.veto_timeframes contains {veto!r}, which is not in "
+                f"strategy.timeframes {timeframes}; it could never veto anything"
+            )
+
+    valid_regimes = {
+        "TRENDING", "RANGING", "HIGH_VOLATILITY", "LOW_VOLATILITY",
+        "BREAKOUT", "BREAKDOWN",
+    }
+    for key in ("scalp_allowed", "breakout_allowed"):
+        allowed = cfg.get(f"strategy.regime.{key}", [])
+        unknown = [r for r in allowed if r not in valid_regimes]
+        if unknown:
+            raise ConfigError(
+                f"strategy.regime.{key} has unknown regime(s) {unknown}; "
+                f"valid values are {sorted(valid_regimes)}"
+            )
+
+    high_pct = cfg.get("strategy.regime.atr_high_percentile", 0.85)
+    low_pct = cfg.get("strategy.regime.atr_low_percentile", 0.15)
+    if not 0.0 <= low_pct < high_pct <= 1.0:
+        raise ConfigError(
+            "strategy.regime requires 0 <= atr_low_percentile < atr_high_percentile <= 1, "
+            f"got low={low_pct}, high={high_pct}"
+        )
+
+    if cfg.get("strategy.regime.adx_ranging", 18) > cfg.get(
+        "strategy.regime.adx_trending", 22
+    ):
+        raise ConfigError(
+            "strategy.regime.adx_ranging must be <= adx_trending; otherwise the two "
+            "bands overlap and a market could classify as both"
+        )
+
     if cfg.get("protection.sl_price_type") not in ("mark", "last", "index"):
         raise ConfigError("protection.sl_price_type must be mark, last, or index")
 

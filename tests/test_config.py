@@ -251,3 +251,79 @@ def test_lower_buffer_did_not_relax_the_other_guarantees():
     assert cfg.get("risk.max_drawdown") == 0.03
     assert cfg.get("risk.max_consecutive_losses") == 3
     assert cfg.get("risk.max_open_positions") == 1
+
+
+# --- PHASE 5: multi-timeframe wiring ---------------------------------------
+
+def test_shipped_timeframe_weights_sum_to_one():
+    cfg = load_config()
+    weights = cfg.get("strategy.timeframe_weights")
+    timeframes = cfg.get("strategy.timeframes")
+    assert sum(weights[t] for t in timeframes) == pytest.approx(1.0)
+
+
+def test_timeframe_weights_must_sum_to_one(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError, match="sum to 1.0"):
+        _mutate(monkeypatch, tmp_path, **{
+            "strategy.timeframe_weights": {"1m": 0.5, "5m": 0.5, "15m": 0.5, "1h": 0.5},
+        })
+
+
+def test_every_timeframe_needs_a_weight(monkeypatch, tmp_path):
+    """A weightless timeframe would be dropped from the blend without a word."""
+    with pytest.raises(ConfigError, match="missing"):
+        _mutate(monkeypatch, tmp_path, **{
+            "strategy.timeframe_weights": {"1m": 0.5, "5m": 0.5},
+        })
+
+
+def test_veto_timeframe_must_be_evaluated(monkeypatch, tmp_path):
+    """A veto timeframe outside strategy.timeframes could never veto anything."""
+    with pytest.raises(ConfigError, match="veto"):
+        _mutate(monkeypatch, tmp_path, **{
+            "strategy.veto_timeframes": ["4h"],
+        })
+
+
+def test_shipped_veto_timeframes_are_evaluated():
+    cfg = load_config()
+    for veto in cfg.get("strategy.veto_timeframes"):
+        assert veto in cfg.get("strategy.timeframes")
+
+
+def test_unknown_regime_name_is_rejected(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError, match="unknown regime"):
+        _mutate(monkeypatch, tmp_path, **{
+            "strategy.regime.scalp_allowed": ["TRENDING", "SIDEWAYS"],
+        })
+
+
+def test_volatility_regimes_are_not_tradeable_in_the_shipped_config():
+    """Both volatility extremes must stay out of every allow-list."""
+    cfg = load_config()
+    for key in ("scalp_allowed", "breakout_allowed"):
+        allowed = cfg.get(f"strategy.regime.{key}")
+        assert "HIGH_VOLATILITY" not in allowed
+        assert "LOW_VOLATILITY" not in allowed
+
+
+def test_atr_percentile_bounds_must_be_ordered(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError, match="atr_low_percentile"):
+        _mutate(monkeypatch, tmp_path, **{
+            "strategy.regime.atr_high_percentile": 0.10,
+            "strategy.regime.atr_low_percentile": 0.90,
+        })
+
+
+def test_adx_bands_must_not_overlap(monkeypatch, tmp_path):
+    """Overlapping bands would let one market classify as trending and ranging."""
+    with pytest.raises(ConfigError, match="adx_ranging"):
+        _mutate(monkeypatch, tmp_path, **{
+            "strategy.regime.adx_ranging": 40,
+            "strategy.regime.adx_trending": 20,
+        })
+
+
+def test_scoring_weights_still_sum_to_one_hundred_with_phase5_keys():
+    weights = load_config().section("strategy")["scoring_weights"]
+    assert sum(weights.values()) == 100

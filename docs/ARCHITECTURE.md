@@ -290,7 +290,7 @@ config.py ---- config.yaml + .env  (pydantic-free dataclass validation, fail-clo
    +-- exchange/websocket.py     fx-ws.gateio.ws/v4/ws/usdt — tickers, book, orders, positions;
    |                             heartbeat, auto-reconnect, forced REST resync on reconnect
    |
-   +-- strategy/indicators.py    EMA 9/21/50/200, RSI, MACD, ATR, VWAP, volume, S/R  (numpy)
+   +-- strategy/indicators.py    EMA 9/21/50/200, RSI, MACD, ATR, ADX, VWAP, volume, S/R  (numpy)
    +-- strategy/regime.py        TRENDING/RANGING/HIGH_VOL/LOW_VOL/BREAKOUT/BREAKDOWN, else SKIP
    +-- strategy/scoring.py       trend 25 / momentum 20 / volume 15 / PA 20 / vol 10 / S-R 10
    +-- strategy/signal_engine.py MTF 1m+5m+15m+1h, BTC filter, threshold >= 80
@@ -599,4 +599,147 @@ ceiling, pivot plateau/NaN/edge handling, and the confirmation-delay and backtes
 
 **No order was sent in this phase.** The module has no network path and no order-placing path.
 
-**Next: PHASE 5 — regime, scoring, signal engine.** Not started; awaiting go-ahead.
+**Next: PHASE 5 — regime, scoring, signal engine.** Complete; see §12.
+
+---
+
+## 12. PHASE 5 — regime, scoring, signal engine (`strategy/`)
+
+Three modules that decide *whether* to trade and *which way*. They stop there: nothing in this
+phase sizes, places, or manages an order, and none of them import `exchange/`, so there is no
+network path and no order path by construction. A test asserts `SignalEngine` exposes no method
+whose name contains `order`, `execute`, or `place`.
+
+```
+regime.py       classify(candles, as_of) -> RegimeResult   what kind of market is this?
+scoring.py      score(candles, direction, as_of) -> ScoreResult   how good is this setup?
+signal_engine.py evaluate(symbol, candles, now, btc) -> Signal    should we act, and which way?
+```
+
+### The lookahead problem, and the one rule that closes it
+
+Gate stamps every candle with its **open** time — verified live: 1h stamps are exact multiples
+of 3600 and the newest one opened minutes ago. So the newest bar of every series is still
+forming, and a bar on interval *T* is complete only at `t + T`.
+
+That single fact causes two distinct bugs, and `closed_bars()` is the only place either is
+resolved:
+
+1. **The forming bar.** Scoring it means trading a candle whose close is not yet known; in
+   replay it is reading the future outright.
+2. **Higher-timeframe leakage.** The 1h bar covering *now* has not closed either. Asking "what
+   is the 1h trend?" at 10:05 must answer from the 09:00 bar, not the 10:00 bar that will not
+   finish until 11:00.
+
+Live confirmation at 23:47 UTC — each timeframe drops exactly the one forming bar, and the 1h
+correctly reports the 22:00 bar rather than the unfinished 23:00 one:
+
+| timeframe | fetched | closed | newest closed bar opened |
+|---|---|---|---|
+| 1m | 300 | 299 | 23:46:00 |
+| 5m | 300 | 299 | 23:40:00 |
+| 15m | 300 | 299 | 23:30:00 |
+| 1h | 300 | 299 | 22:00:00 |
+
+Every module also takes `as_of` and truncates via `Candles.head()` rather than promising not to
+peek, so lookahead is impossible by construction rather than by review. Tests assert bar-by-bar
+that what live sees (`head(i+1)`) equals what a backtest sees (`as_of=i`) — for regime, for
+scoring, and for the engine end-to-end.
+
+### Regime — volatility is checked first, and that ordering is load-bearing
+
+Six states plus `None` (= SKIP, a first-class answer). Order of tests is not interchangeable:
+volatility gates → breakout/breakdown → trend → range → ambiguous.
+
+A textbook EMA stack *during a volatility spike* is precisely the setup that gaps through a
+0.125 % stop, so it must not be reachable as TRENDING. The ATR percentile is measured against the
+symbol's **own** recent history, because a fixed ATR% threshold would call every synthetic quiet
+and every alt violent.
+
+**The percentile uses a midrank, counting ties as half.** Under the obvious
+`(history <= now).mean()`, a market with perfectly steady volatility scores 1.0 — every sample
+equals the current one — so a calm, regular tape reports as HIGH_VOLATILITY and gets vetoed
+exactly when conditions are best. Midrank sends a constant series to 0.5. This was a real bug,
+caught by a test asserting a steady market is not a volatility extreme.
+
+Neither volatility regime appears in any `*_allowed` list, so both are effectively a skip; they
+are still reported by name because "ATR in its 95th percentile" and "the tape is dead" are
+different post-mortems. `HIGH/LOW_VOLATILITY` on **any** timeframe disqualifies, not just the
+entry one — a 5m blowout is the same hazard to a 1m entry whether or not the 1m has noticed yet.
+
+ADX was added to `indicators.py` for this: it distinguishes a real trend from an EMA stack that
+merely happens to be in order during chop, which a moving-average comparison cannot. Verified
+100.0 on clean trends in both directions, 0.0 flat, 4.6 in chop, first valid index `2*period - 1`.
+
+### Scoring — six weighted categories, and what a NaN is worth
+
+Weights come from `strategy.scoring_weights` and each category earns a 0.0-1.0 fraction of its
+weight, so the 0-100 bound holds by construction rather than by clamping. Scores are
+direction-aware: RSI 68 is strength for a long and exhaustion for a short, so there is no such
+thing as a directionless score and `direction=0` is rejected outright.
+
+**A NaN input earns zero, never a midpoint** — an unwarmed indicator is missing information, and
+missing information must not accumulate into a passing score.
+
+Two findings from live data changed the design here:
+
+- **The RSI band has a ceiling.** Buying RSI 85 is chasing something already extended; at 100x
+  with a 0.125 % stop there is no room to survive the snap-back. Full momentum credit requires
+  RSI in 50-72 for a long, not merely "high".
+- **Support/resistance had a real bug.** `nearest_resistance` returning NaN was scored as zero
+  ("unknown, not clear"), which zeroed the category for *every trade into new highs* — the whole
+  breakout playbook — because a monotonic rise contains no pivot highs at all. But the mirror
+  case is also true: a monotonic *decline* has no pivot highs either, while overhead supply is
+  everywhere. Pivot-shaped structure is therefore the wrong sole measure. When no confirmed pivot
+  blocks the way, the scorer falls back to the plainest available fact — the highest high in the
+  lookback window, **excluding the current bar**, since a bar's own high is by definition ≥ its
+  close and including it means no new high could ever read as clear. A "nothing in the way" claim
+  also requires the full lookback horizon behind it; a short window scores zero rather than
+  handing thinly-backed symbols 10 free points.
+
+### Signal engine — everything is a veto
+
+Gates run in order, each ending evaluation with a recorded `stage` and `reason`: data → spread →
+liquidity → BTC filter → regime → volatility → direction → MTF veto → abnormal candle → score.
+The default answer is no. Rejections are auditable — "skipped 400 bars at the spread stage" is
+actionable, "no signal" is not.
+
+Higher timeframes decide direction; the entry timeframe only gets a say when they are silent, and
+a split among the veto timeframes is no trade. RANGING does not veto (a 1h range is context a 5m
+trend can work inside); an opposing *directional* regime does. The BTC correlation filter
+**fails closed**: an alt evaluated without BTC candles is refused, not waved through.
+
+The engine holds no cooldown or position state on purpose — those are Phase 6 concerns, and
+duplicating them here would create two sources of truth about whether trading is permitted.
+
+### Config
+
+New keys under `strategy.regime`, `strategy.scoring`, `strategy.timeframe_weights`, and
+`strategy.veto_timeframes`, all validated fail-closed at load: timeframe weights must cover every
+configured timeframe and sum to 1.0 (a weightless timeframe would be dropped from the blend in
+silence), a veto timeframe must actually be evaluated (otherwise it could never veto anything),
+regime names must be real, ATR percentile bounds must be ordered, and the ADX bands must not
+overlap.
+
+### What this phase does *not* establish
+
+It does not show the strategy is profitable. A score ≥ 80 across six categories on four
+timeframes is rare by design (§7), and on live BTC/ETH/SOL at 23:47 UTC every symbol was rejected
+at the regime stage — 5m and 15m were both in a volatility extreme. That is the filter working as
+specified, but whether the surviving trades win above the ~40 % break-even rate is a Phase 9
+backtesting question and may still answer "no".
+
+### Tests
+
+97 new tests (27 regime + 42 scoring + 28 engine), **423 total**, no network. Expectations are
+derived from hand-built paths whose character is obvious by construction — a monotonic ramp *is*
+a trend — so a bug cannot make its own test pass. Coverage: all six regimes reachable, the
+volatility-first ordering, midrank tie handling, score bounds and direction-awareness, NaN-earns-
+zero, the RSI ceiling, both SR fallback directions, the closed-bar boundary (inclusive at
+`t + T`, exclusive a tick before), MTF conflict, BTC fail-closed, and bar-by-bar backtest/live
+parity for all three modules.
+
+**No order was sent in this phase.** No module here imports `exchange/`; there is no network path
+and no order-placing path.
+
+**Next: PHASE 6 — risk manager.** Not started; awaiting go-ahead.

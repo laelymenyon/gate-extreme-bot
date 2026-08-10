@@ -12,7 +12,9 @@ import pytest
 
 from strategy.indicators import (
     Candles,
+    adx,
     atr,
+    confirmed_swing_levels,
     ema,
     macd,
     nearest_resistance,
@@ -721,3 +723,151 @@ def test_candles_feed_all_indicators_end_to_end():
         assert len(array) == 260, name
         assert not np.isnan(array[-1]), f"{name} still NaN at the last bar"
     assert not np.isnan(macd(c.close).histogram[-1])
+
+
+# --- ADX (Phase 5 addition) ------------------------------------------------
+
+def test_adx_first_valid_index_is_double_period_minus_one():
+    """Double smoothing: DX needs `period`, then ADX smooths DX again."""
+    out = adx(np.arange(2.0, 102.0), np.arange(0.0, 100.0), np.arange(1.0, 101.0), 14)
+    assert np.all(np.isnan(out[:27]))
+    assert not np.isnan(out[27])
+
+
+def test_adx_is_bounded_zero_to_one_hundred(series):
+    high, low, close, _ = series
+    out = adx(high, low, close, 14)
+    valid = out[~np.isnan(out)]
+    assert valid.size > 0
+    assert np.all((valid >= 0.0) & (valid <= 100.0))
+
+
+def test_adx_is_high_in_a_clean_trend():
+    up = np.arange(1.0, 121.0)
+    assert adx(up + 1, up - 1, up, 14)[-1] > 50.0
+
+
+def test_adx_measures_strength_not_direction():
+    """A mirrored downtrend must score the same as the uptrend."""
+    up = np.arange(1.0, 121.0)
+    down = up[::-1].copy()
+    assert adx(up + 1, up - 1, up, 14)[-1] == pytest.approx(
+        adx(down + 1, down - 1, down, 14)[-1], rel=1e-9
+    )
+
+
+def test_adx_is_low_in_chop():
+    rng = np.random.default_rng(1)
+    chop = 100 + rng.normal(0, 1, 300)
+    assert adx(chop + 0.5, chop - 0.5, chop, 14)[-1] < 30.0
+
+
+def test_adx_of_flat_market_is_zero_not_nan():
+    """No movement is a reading, not missing data."""
+    flat = np.full(120, 100.0)
+    assert adx(flat + 1, flat - 1, flat, 14)[-1] == pytest.approx(0.0)
+
+
+def test_adx_insufficient_data_is_all_nan():
+    short = np.arange(1.0, 21.0)
+    assert np.all(np.isnan(adx(short + 1, short - 1, short, 14)))
+
+
+def test_adx_has_no_lookahead(series):
+    high, low, close, _ = series
+    full = adx(high, low, close, 14)
+    for i in (100, 200, 299):
+        truncated = adx(high[: i + 1], low[: i + 1], close[: i + 1], 14)
+        assert truncated[i] == pytest.approx(full[i], rel=1e-12)
+
+
+def test_adx_mismatched_lengths_rejected():
+    with pytest.raises(ValueError, match="same length"):
+        adx(np.ones(10), np.ones(9), np.ones(10), 5)
+
+
+# --- Candles.head (Phase 5 addition) ---------------------------------------
+
+def test_head_returns_the_first_n_bars():
+    c = Candles.from_gate(GATE_ROWS)
+    assert len(c.head(1)) == 1
+    assert c.head(1).close[0] == pytest.approx(c.close[0])
+
+
+def test_head_beyond_length_is_the_whole_series():
+    c = Candles.from_gate(GATE_ROWS)
+    assert len(c.head(99)) == len(c)
+
+
+def test_head_zero_is_empty():
+    assert len(Candles.from_gate(GATE_ROWS).head(0)) == 0
+
+
+def test_head_rejects_negative_count():
+    with pytest.raises(ValueError, match=">= 0"):
+        Candles.from_gate(GATE_ROWS).head(-1)
+
+
+def test_head_does_not_mutate_the_original():
+    c = Candles.from_gate(GATE_ROWS)
+    before = c.close.copy()
+    c.head(1)
+    np.testing.assert_array_equal(c.close, before)
+
+
+def test_head_preserves_every_column():
+    c = Candles.from_gate(GATE_ROWS)
+    head = c.head(1)
+    for name in ("time", "open", "high", "low", "close", "volume", "turnover"):
+        assert len(getattr(head, name)) == 1
+
+
+def test_head_drops_turnover_only_when_absent():
+    rows = [{k: v for k, v in row.items() if k != "sum"} for row in GATE_ROWS]
+    assert Candles.from_gate(rows).head(1).turnover is None
+
+
+def test_head_matches_indicator_truncation(series):
+    """head(i+1) must equal slicing — the basis of every lookahead test."""
+    high, low, close, volume = series
+    c = Candles(
+        time=np.arange(len(close), dtype=float), open=close, high=high,
+        low=low, close=close, volume=volume,
+    )
+    np.testing.assert_allclose(ema(c.head(100).close, 21), ema(close[:100], 21),
+                               equal_nan=True)
+
+
+# --- confirmed_swing_levels (Phase 5 addition) -----------------------------
+
+def test_confirmed_levels_returns_pivot_prices():
+    levels = confirmed_swing_levels(PIVOT_HIGH, left=2, right=2, high=True)
+    np.testing.assert_allclose(sorted(levels), [15.0, 20.0])
+
+
+def test_confirmed_levels_respects_the_confirmation_delay():
+    """The index-6 pivot is not knowable until bar 8."""
+    assert 20.0 not in confirmed_swing_levels(PIVOT_HIGH, as_of=7, left=2, right=2)
+    assert 20.0 in confirmed_swing_levels(PIVOT_HIGH, as_of=8, left=2, right=2)
+
+
+def test_confirmed_levels_respects_the_lookback_window():
+    high = np.concatenate([PIVOT_HIGH[:5], np.full(60, 12.0)])
+    assert 15.0 not in confirmed_swing_levels(high, lookback=50, left=2, right=2)
+    assert 15.0 in confirmed_swing_levels(high, lookback=100, left=2, right=2)
+
+
+def test_confirmed_levels_finds_lows_when_asked():
+    levels = confirmed_swing_levels(PIVOT_LOW, left=2, right=2, high=False)
+    np.testing.assert_allclose(sorted(levels), [2.0, 5.0])
+
+
+def test_confirmed_levels_on_empty_series_is_empty():
+    assert len(confirmed_swing_levels(np.array([]), left=2, right=2)) == 0
+
+
+def test_confirmed_levels_backs_the_nearest_level_helpers():
+    """The helpers must agree with the shared rule they are built on."""
+    levels = confirmed_swing_levels(PIVOT_HIGH, left=2, right=2, high=True)
+    above = levels[levels > 12.0]
+    assert nearest_resistance(PIVOT_HIGH, 12.0, 2, 2) == pytest.approx(above.min())

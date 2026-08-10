@@ -40,10 +40,58 @@ strategy:
     price_action: 20
     volatility: 10
     support_resistance: 10
+  # PHASE 5. Per-category thresholds. Each category earns a 0.0-1.0 fraction of its
+  # weight above; a NaN input earns zero, never a midpoint, so thin history cannot
+  # score its way past minimum_score.
+  scoring:
+    rsi_period: 14
+    rsi_long_floor: 50           # long momentum credit starts here
+    rsi_long_ceiling: 72         # ...and is withdrawn above here (chasing an extreme)
+    rsi_short_ceiling: 50
+    rsi_short_floor: 28
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    rvol_period: 20
+    rvol_full_credit: 2.0        # relative volume earning the whole volume weight
+    rvol_no_credit: 0.8          # at or below this, participation is absent -> 0
+    body_full_credit: 0.65       # candle body / range: conviction, not a doji
+    atr_pct_floor: 0.0006        # below this there is no move to pay for the fees
+    atr_pct_ideal: 0.0020        # the sweet spot for a 100x scalp
+    atr_pct_ceiling: 0.0060      # above this, stops get run by noise
+    sr_room_atr_full: 3.0        # clear ATRs to the opposing level for full credit
+    sr_room_atr_none: 0.5        # less than this and the trade is walking into a wall
   regime:
     require_clear_regime: true  # ambiguous regime -> SKIP
     scalp_allowed:    [TRENDING, RANGING]
     breakout_allowed: [BREAKOUT, BREAKDOWN]
+    # PHASE 5. Thresholds for the classifier. Neither HIGH_VOLATILITY nor LOW_VOLATILITY
+    # appears in any *_allowed list above, so both are effectively a SKIP — that is
+    # deliberate and the classifier checks them first.
+    ema_separation_trend: 0.0008   # |EMA9-EMA21|/price above this = directional, not chop
+    ema_separation_chop: 0.0003    # below this the fast EMAs are entangled = RANGING
+    adx_period: 14
+    adx_trending: 22               # ADX above this confirms a trend
+    adx_ranging: 18                # below this, no trend regardless of EMA order
+    atr_period: 14
+    atr_lookback: 100              # window for the ATR percentile
+    atr_high_percentile: 0.85      # ATR above this pctile of its own history = HIGH_VOLATILITY
+    atr_low_percentile: 0.15       # below = LOW_VOLATILITY (spreads eat a 0.125% stop)
+    breakout_lookback: 50          # bars of confirmed structure to break out of
+    breakout_atr_buffer: 0.25      # close must clear the level by this * ATR to count
+    breakout_min_rvol: 1.5         # an unvolumed break is a fakeout
+    min_bars: 210                  # EMA200 needs 200 + slack; below this -> None (SKIP)
+
+  # PHASE 5. Multi-timeframe confluence. Higher timeframes veto lower ones: the 1m entry
+  # trigger cannot overrule the 1h trend. Weights are the contribution of each timeframe
+  # to the blended score and must sum to 1.0.
+  timeframe_weights:
+    1m: 0.15                     # entry timing only
+    5m: 0.25
+    15m: 0.30
+    1h: 0.30                     # structural context carries the most weight
+  # A timeframe whose regime disagrees with the trade direction vetoes it outright.
+  veto_timeframes: [15m, 1h]
 
 protection:
   # DECISION (user, 2026-08-09): lowered 0.50% -> 0.30% so the mmr-0.50% contracts become tradable.

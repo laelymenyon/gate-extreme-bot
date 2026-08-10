@@ -3,9 +3,11 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 4 of 14 complete.** Environment, REST client, market-data feed, indicators.
-> No trading logic yet — signals, scoring, and risk begin in Phase 5.
-> No trading logic exists yet. Nothing in this repo can place an order.
+> **Status: PHASE 5 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> regime detection, signal scoring, signal engine.
+> The bot can now decide *whether* and *which way* to trade. It cannot act on that decision:
+> sizing and risk begin in Phase 6, execution in Phase 10.
+> **Nothing in this repo can place an order.**
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
 100x leverage means a 1 % adverse move against full margin is a total loss of that margin.
@@ -189,6 +191,47 @@ floor and well inside BTC's 0.325 % ceiling at 100x.
 122 indicator tests, 293 total. Reference values are recomputed independently inside the tests,
 so a bug in `indicators.py` cannot make its own test pass.
 
+## What Phase 5 added — the decision layer
+
+`strategy/regime.py`, `strategy/scoring.py`, `strategy/signal_engine.py`. Together they answer
+*whether* to trade and *which way*, and stop there — none of them import `exchange/`, so there is
+no network path and no order path. A test asserts `SignalEngine` exposes no method named
+`order`, `execute`, or `place`.
+
+**One rule closes the lookahead problem.** Gate stamps candles with their *open* time (verified
+live: 1h stamps are exact multiples of 3600), so the newest bar of every series is still forming
+and a bar on interval *T* completes only at `t + T`. `closed_bars()` is the single place that
+convention lives, and it fixes two bugs at once: scoring a forming candle, and asking "what is
+the 1h trend?" at 10:05 and getting the unfinished 10:00 bar instead of the 09:00 one. Checked
+live at 23:47 UTC — each timeframe dropped exactly its one forming bar and the 1h correctly
+reported the 22:00 bar. Every module also takes `as_of` and physically truncates its input, so
+tests can assert bar-by-bar that live (`head(i+1)`) and backtest (`as_of=i`) agree.
+
+**Regime checks volatility first, and the order matters.** A textbook EMA stack *during* a
+volatility spike is exactly the setup that gaps through a 0.125 % stop, so it must not be
+reachable as TRENDING. ATR is ranked against the symbol's own recent history — a fixed threshold
+would call every synthetic quiet and every alt violent — using a midrank that counts ties as
+half. The obvious `(history <= now).mean()` scores a perfectly steady market at 1.0 and would
+veto it as HIGH_VOLATILITY exactly when conditions are best; a test pins that.
+
+**Scoring is direction-aware and fails closed.** Six weighted categories, each earning a 0.0-1.0
+fraction of its weight so the 0-100 bound holds by construction. A NaN earns zero, never a
+midpoint. The RSI band has a ceiling — buying RSI 85 is chasing, and at a 0.125 % stop there is
+no room to survive the snap-back. Support/resistance needed the subtlest fix: "no pivot overhead"
+means clear space in a rally but nothing of the sort in a decline, since neither has pivot highs,
+so it falls back to the lookback-window extreme excluding the current bar.
+
+**The engine is all vetoes**, each recording a stage and reason: data → spread → liquidity → BTC
+filter → regime → volatility → direction → MTF veto → abnormal candle → score. Higher timeframes
+decide direction and a split among them is no trade; the BTC correlation filter refuses an alt
+outright when BTC data is absent.
+
+On live BTC/ETH/SOL every symbol was rejected at the regime stage (5m and 15m both in a
+volatility extreme) — the filter working as specified, not a fault. Whether the trades that do
+survive win above the ~40 % break-even rate is a Phase 9 question.
+
+97 new tests (27 regime + 42 scoring + 28 engine), **423 total**, no network.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -215,6 +258,7 @@ backtest/   engine.py
 database/   models.py
 monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
+            test_regime.py  test_scoring.py  test_signal_engine.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -226,8 +270,8 @@ docs/       ARCHITECTURE.md
 | 2 | Gate.io REST client (signing, backoff, idempotency) | **done** |
 | 3 | Market data + WebSocket (feed, watchdog, REST resync) | **done** |
 | 4 | Indicators | **done** |
-| 5 | Signal scoring | next |
-| 6 | Risk manager | pending |
+| 5 | Regime + signal scoring + signal engine | **done** |
+| 6 | Risk manager | next |
 | 7 | Liquidation protection | pending |
 | 8 | Paper trading | pending |
 | 9 | Backtesting + walk-forward | pending |

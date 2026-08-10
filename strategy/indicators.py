@@ -34,6 +34,7 @@ __all__ = [
     "macd",
     "true_range",
     "atr",
+    "adx",
     "vwap",
     "rolling_vwap",
     "volume_ma",
@@ -42,6 +43,7 @@ __all__ = [
     "swing_lows",
     "nearest_support",
     "nearest_resistance",
+    "confirmed_swing_levels",
 ]
 
 
@@ -125,6 +127,28 @@ class Candles:
             close=column("c"),
             volume=column("v"),
             turnover=column("sum") if "sum" in rows[0] else None,
+        )
+
+    def head(self, count: int) -> "Candles":
+        """The first ``count`` bars — exactly what a live run would have held then.
+
+        Every Phase 5 module takes its history through this, so "replay bar *i*" and
+        "live at bar *i*" are the same object rather than two code paths that have to be
+        kept in agreement by hand. Tests use it to assert that a decision made on the
+        full array with ``as_of=i`` matches one made on a truncated array.
+        """
+        count = int(count)
+        if count < 0:
+            raise ValueError(f"count must be >= 0, got {count}")
+        count = min(count, len(self))
+        return Candles(
+            time=self.time[:count],
+            open=self.open[:count],
+            high=self.high[:count],
+            low=self.low[:count],
+            close=self.close[:count],
+            volume=self.volume[:count],
+            turnover=None if self.turnover is None else self.turnover[:count],
         )
 
 
@@ -303,6 +327,69 @@ def atr(
     return _wilder_rma(true_range(high, low, close), period)
 
 
+def adx(
+    high: Sequence[float] | np.ndarray,
+    low: Sequence[float] | np.ndarray,
+    close: Sequence[float] | np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """Wilder's ADX — trend *strength*, with no opinion on direction.
+
+    The regime classifier needs to tell a real trend from an EMA stack that merely
+    happens to be in order during chop, which is what ADX measures and a moving-average
+    comparison cannot. Rising and falling markets both score high; only the presence of
+    directional movement matters.
+
+    Wilder's construction: directional movement is the excess of one side's move over the
+    other (ties and inside bars count as zero), both legs and the true range are
+    RMA-smoothed over ``period``, DX is their normalised difference, and ADX is a second
+    RMA of DX. That double smoothing puts the first valid index at ``2 * period - 1``.
+    A period of flat or zero-range bars yields DX 0, not NaN — no movement is a reading,
+    not missing data.
+    """
+    h = _as_float_array(high, "high")
+    l = _as_float_array(low, "low")
+    c = _as_float_array(close, "close")
+    _require_same_length(high=h, low=l, close=c)
+    period = _check_period(period)
+
+    out = _nan_like(h)
+    if len(h) < 2 * period:
+        return out
+
+    up_move = np.diff(h)
+    down_move = -np.diff(l)
+    # A bar only counts toward one side: the larger, strictly-positive excess wins.
+    plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
+
+    tr = true_range(h, l, c)[1:]
+    smooth_tr = _wilder_rma(tr, period)
+    smooth_plus = _wilder_rma(plus_dm, period)
+    smooth_minus = _wilder_rma(minus_dm, period)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di = 100.0 * np.divide(smooth_plus, smooth_tr)
+        minus_di = 100.0 * np.divide(smooth_minus, smooth_tr)
+        total = plus_di + minus_di
+        dx = 100.0 * np.divide(np.abs(plus_di - minus_di), total)
+
+    # Zero range over the whole window is a legitimately trendless market.
+    dx = np.where((smooth_tr == 0.0) | (total == 0.0), 0.0, dx)
+
+    # Seed the second smoothing from the first *valid* DX; averaging in the warm-up NaNs
+    # would poison the seed and leave the whole series NaN.
+    smoothed = _nan_like(dx)
+    valid = ~np.isnan(dx)
+    if valid.any():
+        start = int(np.argmax(valid))
+        smoothed[start:] = _wilder_rma(dx[start:], period)
+
+    # diff() dropped bar 0, so shift back to align index i with bar i.
+    out[1:] = smoothed
+    return out
+
+
 # --- volume-weighted -------------------------------------------------------
 
 def _typical_price(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
@@ -464,6 +551,46 @@ def swing_lows(
     return _pivots(array, _check_period(left, "left"), _check_period(right, "right"), False)
 
 
+def confirmed_swing_levels(
+    values: Sequence[float] | np.ndarray,
+    as_of: int | None = None,
+    left: int = 2,
+    right: int = 2,
+    lookback: int = 50,
+    high: bool = True,
+) -> np.ndarray:
+    """Prices of the swing pivots that were **discoverable at** ``as_of``.
+
+    A pivot at bar *j* is included only when ``j + right <= as_of`` (its confirmation bar
+    has printed) and ``j > as_of - lookback`` (it is still recent structure). Order
+    follows the bars, oldest first.
+
+    This is the one place the confirmation rule is written down. ``nearest_support``,
+    ``nearest_resistance``, and the regime classifier all route through it, so there is a
+    single definition of "a level that existed yet" to audit rather than three copies
+    that could drift apart.
+    """
+    array = _as_float_array(values, "values")
+    left = _check_period(left, "left")
+    right = _check_period(right, "right")
+    lookback = _check_period(lookback, "lookback")
+
+    n = len(array)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+
+    if as_of is None:
+        as_of = n - 1
+    else:
+        as_of = int(as_of)
+        if not 0 <= as_of < n:
+            raise ValueError(f"as_of must be in [0, {n - 1}], got {as_of}")
+
+    index = np.flatnonzero(_pivots(array, left, right, high))
+    index = index[(index + right <= as_of) & (index > as_of - lookback)]
+    return array[index]
+
+
 def _level(
     values: np.ndarray,
     price: float,
@@ -473,35 +600,18 @@ def _level(
     as_of: int | None,
     above: bool,
 ) -> float:
-    n = len(values)
-    if n == 0:
+    if len(values) == 0:
         return float("nan")
-
-    if as_of is None:
-        as_of = n - 1
-    else:
-        as_of = int(as_of)
-        if not 0 <= as_of < n:
-            raise ValueError(f"as_of must be in [0, {n - 1}], got {as_of}")
 
     price = float(price)
     if not np.isfinite(price):
         return float("nan")
 
-    mask = _pivots(values, left, right, above)
-    index = np.flatnonzero(mask)
-    if index.size == 0:
+    levels = confirmed_swing_levels(values, as_of, left, right, lookback, high=above)
+    beyond = levels[levels > price] if above else levels[levels < price]
+    if beyond.size == 0:
         return float("nan")
-
-    # Confirmed by as_of, inside the lookback window, and on the correct side of price.
-    eligible = index[
-        (index + right <= as_of)
-        & (index > as_of - lookback)
-        & ((values[index] > price) if above else (values[index] < price))
-    ]
-    if eligible.size == 0:
-        return float("nan")
-    return float(values[eligible].min() if above else values[eligible].max())
+    return float(beyond.min() if above else beyond.max())
 
 
 def nearest_resistance(
