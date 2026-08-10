@@ -3,9 +3,9 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 9 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 10 of 14 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
-> liquidation protection, order execution, backtesting.
+> liquidation protection, order execution, backtesting, paper trading.
 > The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
 > to at all*, and *whether the stop survives contact with liquidation* — and it can place and
 > verify those orders, including the protective stop.
@@ -428,6 +428,36 @@ volatility regimes, zero vetoes. Details in
 
 47 new tests, **759 total**, no network.
 
+## What Phase 10 added — the paper-trading loop
+
+`paper/loop.py`. The first place every layer runs as a system, in the order a live run uses:
+market data → risk breakers → signal → size → liquidation guard → entry → protect.
+
+Its value is not more statistics — Phase 9 measures the strategy. It is that this exercises
+what a backtest never touches: the order state machine, the SL-first sequence, protective
+orders resting on an exchange, and what happens when an entry misses or a stop cannot be
+verified. A backtest computes what a trade *would* have earned; this finds out whether the
+bot can carry one.
+
+**It cannot trade for real.** `PaperTrader` **refuses to construct** when the safety gate is
+open — not a branch inside the loop, and no flag overrides it — and refuses again if the
+resolved gateway is not the simulator. Market data is a protocol: replay recorded candles, or
+pull live ones through the Phase 2 client whose reads stay available while the write-guard is
+shut.
+
+**It found two real defects that only an end-to-end run reaches.** The simulator ignored
+`reduce_only`, so after TP1 trimmed a position the full-size stop **reversed** it instead of
+closing it. And a post-only entry submitted at the mark filled instantly, gifting every paper
+run the maker rebate and erasing the unfilled-entry outcome that is supposed to be frequent —
+which would have made every paper result look better than the live venue ever will. Both are
+fixed and pinned by tests.
+
+Rejections are counted by the stage that refused (`no_signal`, `cooldown`,
+`size:order_size_min`, `liq:buffer`, `entry:expired`), because the loop's normal state is
+doing nothing and that should be visible rather than hidden.
+
+38 new tests, **797 total**, no network.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -450,13 +480,14 @@ exchange/   gate_client.py  websocket.py
 strategy/   indicators.py  signal_engine.py  regime.py  scoring.py
 risk/       risk_manager.py  position_sizer.py  liquidation_guard.py
 execution/  order_manager.py  protection.py
+paper/      loop.py
 backtest/   engine.py
 database/   models.py
 monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
             test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
-            test_execution.py  test_backtest.py
+            test_execution.py  test_backtest.py  test_paper.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -473,8 +504,8 @@ docs/       ARCHITECTURE.md
 | 7 | Liquidation protection (tiered mmr + buffer guard) | **done** |
 | 8 | Order execution + protection (`execution/`) | **done** |
 | 9 | Backtesting + walk-forward | **done** |
-| 10 | Paper-trading loop (wiring the layers end to end) | next |
-| 11 | Dashboard + database | pending |
+| 10 | Paper-trading loop (wiring the layers end to end) | **done** |
+| 11 | Dashboard + database | next |
 | 12 | Testing | pending |
 | 13 | Paper trading validation | pending |
 | 14 | Live readiness | pending |

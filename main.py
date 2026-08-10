@@ -28,7 +28,7 @@ PHASES = [
     ("7",  "Liquidation protection",       True),
     ("8",  "Order execution",             True),
     ("9",  "Backtesting",                  True),
-    ("10", "Paper trading loop",          False),
+    ("10", "Paper trading loop",          True),
     ("11", "Dashboard + database",         False),
     ("12", "Testing",                      False),
     ("13", "Paper trading validation",     False),
@@ -146,8 +146,16 @@ def main(argv: list[str] | None = None) -> int:
         print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
         print("No orders will be sent.")
 
-    print(f"\nPhases 1-9 complete. The '{args.mode}' engine arrives in a later phase; "
-          "nothing was traded.")
+    if args.mode == "paper":
+        print("\nPaper trading is implemented (paper/loop.py). Wiring it to live candles "
+              "needs a symbol and a data source;")
+        print("see tests/test_paper.py for a complete runnable example. No real order can "
+              "be placed: PaperTrader refuses to")
+        print("construct while the safety gate is open, and it only ever uses the "
+              "in-process simulator.")
+    else:
+        print(f"\nPhases 1-10 complete. The '{args.mode}' engine arrives in a later "
+              "phase; nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0
 

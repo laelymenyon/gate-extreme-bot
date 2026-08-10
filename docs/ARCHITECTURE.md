@@ -1198,4 +1198,77 @@ guard across four volatility regimes.
 
 **No order was sent and no socket was opened in this phase.**
 
-**Next: PHASE 10 — paper-trading loop.** Not started; awaiting go-ahead.
+**Next: PHASE 10 — paper-trading loop.** Complete; see §17.
+
+---
+
+## 17. PHASE 10 — the paper-trading loop (`paper/loop.py`)
+
+Phases 5-9 each answer one question and stop. This is the first place they run as a system,
+in the order a live run uses:
+
+```
+market data -> risk breakers -> signal -> size -> liquidation guard -> entry -> protect
+```
+
+Its value is not another set of statistics — Phase 9 already measures the strategy. It is
+that this exercises what a backtest deliberately never touches: the order state machine, the
+SL-first sequence, protective orders resting on an exchange, and how those behave when an
+entry does not fill or a stop cannot be verified. A backtest computes what a trade *would*
+have earned; this finds out whether the bot can carry one.
+
+### It cannot trade for real
+
+Paper mode is not a flag on the live path, it is a different gateway. `OrderManager.for_config`
+returns a `SimulatedGateway` whenever the three switches disagree, and beyond that
+**`PaperTrader` refuses to construct** when `Config.live_enabled` is true. "Accidentally ran
+the paper loop against the real exchange" is therefore not a reachable state rather than one
+guarded by a conditional, and there is no flag to override it. A second check refuses if the
+resolved gateway is not the simulator at all.
+
+Market data is a protocol: `ReplayMarketSource` walks recorded candles (tests, offline runs),
+`RestMarketSource` pulls live candles through the Phase 2 client, whose reads stay available
+while the write-guard is shut. Watching the real market while trading an imaginary account is
+the combination worth validating. Both truncate every timeframe **by wall-clock instant**, not
+by bar count, so a slower timeframe cannot leak a bar that has not closed.
+
+### Two real defects it exposed
+
+Neither was visible to Phase 8's tests or Phase 9's, because only an end-to-end run reaches
+them.
+
+1. **The simulator ignored `reduce_only`.** After TP1 trimmed a position, the stop — still
+   sized for the *whole* original position — filled in full and opened a **reversed**
+   position. Gate.io clamps reduce-only orders server-side; the simulator now does too
+   (`_clamp_reduce_only`). Without it a stopped-out trade after a partial take-profit looked
+   like a vanished trade rather than an error. Fixed in `execution/order_manager.py`.
+2. **A post-only entry submitted at the mark filled instantly.** The simulator fills a resting
+   limit on equality, so every paper entry was gifted the maker rebate and the unfilled-entry
+   outcome — which §5 says should be *frequent* — never occurred. The loop now rests one tick
+   passive, and polls by advancing the replay rather than sleeping on a wall clock, so the
+   post-only timeout is measured against real bars.
+
+Both are pinned by tests. The second matters most: it would have made every paper run look
+better than the live venue ever will.
+
+### Reporting
+
+`PaperReport` counts steps, entries attempted/filled/expired, protection failures, flattened
+positions, and rejections keyed by the stage that refused — `no_signal`, `cooldown`,
+`size:order_size_min`, `liq:buffer`, `entry:expired`. The loop's normal state is doing
+nothing, and that is reported rather than hidden. Equity reconciles exactly with the sum of
+each trade's net PnL, and the entry rebate is credited when the entry fills rather than at
+close.
+
+### Tests
+
+38 new tests, **797 total**, no network. Coverage: construction refused on an open gate, no
+client ever touched, both source types, the no-lookahead truncation, full round trips to TP3
+and to the stop in both directions, the loss staying inside the risk budget, every layer's
+veto counted by stage, an unfilled post-only entry, an unprotectable position flattened and
+charged, partial fills, reduce-only clamping in both directions, equity reconciliation, and
+reproducibility.
+
+**No real order was sent in this phase.**
+
+**Next: PHASE 11 — dashboard + database.** Not started; awaiting go-ahead.

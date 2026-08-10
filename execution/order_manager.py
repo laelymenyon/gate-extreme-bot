@@ -263,6 +263,22 @@ class SimulatedGateway:
         self._next_id += 1
         return str(self._next_id)
 
+    def _clamp_reduce_only(self, symbol: str, size: int) -> int:
+        """A reduce-only order can shrink a position but never flip or grow it.
+
+        Gate.io enforces this server-side, so an order sized for the whole position still
+        closes correctly after a partial take-profit has already trimmed it. Without the
+        clamp the simulator would fill the full size and open a *reversed* position — the
+        exact outcome ``reduce_only`` exists to prevent, and one that would look like a
+        vanished trade rather than an error.
+        """
+        held = int(self.positions.get(symbol, {}).get("size", 0))
+        if held == 0:
+            return 0
+        if (held > 0) == (size > 0):        # same direction: this would add, not reduce
+            return 0
+        return -held if abs(size) > abs(held) else size
+
     def _apply_fill(self, symbol: str, size: int, price: float) -> None:
         position = self.positions.setdefault(
             symbol,
@@ -289,11 +305,15 @@ class SimulatedGateway:
         position["liq_price"] = entry * (1 - distance) if new > 0 else entry * (1 + distance)
 
     def _fill(self, order: dict[str, Any], price: float) -> None:
+        size = int(order["size"])
+        if order.get("is_reduce_only") and not order.get("is_close"):
+            size = self._clamp_reduce_only(order["contract"], size)
         order["left"] = 0
         order["status"] = "finished"
         order["finish_as"] = "filled"
         order["fill_price"] = str(price)
-        self._apply_fill(order["contract"], int(order["size"]), float(price))
+        if size:
+            self._apply_fill(order["contract"], size, float(price))
 
     def _maybe_fill(self, order: dict[str, Any], price: float) -> None:
         """A resting limit fills only when the market trades through it."""
@@ -440,6 +460,8 @@ class SimulatedGateway:
             size = int(initial["size"])
             if initial.get("close") or size == 0:
                 size = -int(self.positions.get(initial["contract"], {}).get("size", 0))
+            elif initial.get("reduce_only"):
+                size = self._clamp_reduce_only(initial["contract"], size)
             if size:
                 self._apply_fill(initial["contract"], size, trigger)
             touched.append(order["id"])
