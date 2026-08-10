@@ -83,20 +83,33 @@ class TradeRecord:
         return 1 if self.side == "long" else -1
 
     @classmethod
-    def from_paper(cls, trade: Any, *, leverage: int, margin: float = 0.0,
+    def from_paper(cls, trade: Any, *, leverage: int, margin: float | None = None,
                    equity_before: float | None = None, regime: str = "",
                    mode: str = "paper") -> "TradeRecord":
         """Build from a Phase 10 ``PaperTrade`` or a Phase 9 ``Trade``.
 
         Both carry the same shape for the fields that matter, so one adapter serves paper
         and backtest runs and the stored history is comparable across them.
+
+        **Every field is read with a default, which makes an absent one silent.** That is
+        convenient for two producers with different field lists and dangerous for exactly
+        one field: a missing ``r_multiple`` stores ``0.0``, and since
+        :func:`~monitoring.dashboard.compute` averages that column into ``expectancy_r``,
+        a whole run of profitable trades can report zero expectancy without a single
+        exception. Phase 13 found paper trades doing this.
+
+        **R is not derived here on purpose.** The denominator is the stop distance over
+        the position's *coin* amount, and converting contracts to coins needs the
+        contract's quanto multiplier — which no trade object carries. Deriving it from
+        ``size`` alone is wrong by that multiplier (a factor of 10,000 on BTC), so the
+        producer, which knows the contract, reports R and this adapter only passes it
+        through.
         """
         equity_after = float(getattr(trade, "equity_after", 0.0) or 0.0)
         net = float(getattr(trade, "net_pnl", 0.0) or 0.0)
         before = equity_before if equity_before is not None else equity_after - net
         stop = float(getattr(trade, "stop_price", 0.0) or 0.0)
         entry = float(getattr(trade, "entry_price", 0.0) or 0.0)
-        risk = abs(entry - stop) * abs(int(getattr(trade, "size", 0) or 0))
         return cls(
             timestamp=float(getattr(trade, "exit_time", 0.0) or 0.0),
             symbol=str(getattr(trade, "symbol", "")),
@@ -105,7 +118,9 @@ class TradeRecord:
             entry_price=entry,
             exit_price=float(getattr(trade, "exit_price", 0.0) or 0.0),
             size=int(getattr(trade, "size", 0) or 0),
-            margin=float(margin),
+            margin=float(
+                margin if margin is not None else getattr(trade, "margin", 0.0) or 0.0
+            ),
             stop_loss=stop,
             fees=float(getattr(trade, "fees", 0.0) or 0.0),
             funding=float(getattr(trade, "funding", 0.0) or 0.0),
@@ -120,6 +135,7 @@ class TradeRecord:
                 - float(getattr(trade, "entry_time", 0.0) or 0.0)
             ),
             equity_after=equity_after,
+            liquidation_price=float(getattr(trade, "liquidation_price", 0.0) or 0.0),
             mode=mode,
         )
 

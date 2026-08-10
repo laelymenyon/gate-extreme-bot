@@ -1,6 +1,6 @@
 # PHASE 1 — Environment, Verified API Facts, Architecture
 
-Status: **PHASE 12 of 14 complete.** Phases 2-12 are documented in §§9-19 below; 1028 tests
+Status: **PHASE 13 of 14 complete.** Phases 2-13 are documented in §§9-20 below; 1076 tests
 pass and **no live order has ever been sent.**
 All numbers below were pulled live from Gate.io on 2026-08-09, not from memory.
 
@@ -1475,4 +1475,103 @@ defects pinned against reversion, and the CLI's exit codes and gate reporting.
 **No real order was sent in this phase.** The only new file that runs at import time is a
 test fixture that blocks sockets.
 
-**Next: PHASE 13 — paper trading validation.** Not started; awaiting go-ahead.
+**Next: PHASE 13 — paper trading validation.** Complete; see §20.
+
+---
+
+## 20. PHASE 13 — paper-trading validation (`paper/validation.py`)
+
+The roadmap gates live trading on one sentence: *live trading is not enabled until paper
+trading has run correctly and backtesting shows the edge is not merely an artifact of
+leverage.* That is two claims which fail in different ways, and this phase keeps them
+apart rather than averaging them into a single number.
+
+**"Ran correctly" is a question about the machine, not the money.** It is answerable from
+a handful of trades: was every filled entry protected, did anything get liquidated, did a
+single loss exceed what the sizer budgeted, does the stored ledger reconcile with the
+equity the run finished on, did the run end flat. A run that *lost money* while obeying
+every invariant passes this. A run that *made money* while leaving one position
+unprotected does not. None of these checks has a configurable threshold, because a safety
+property that can be tuned off is not one.
+
+**"Not merely an artifact of leverage" is a question about R.** Position size is
+`risk / stop_distance` (invariant 3), so a trade's R-multiple is what it earned per unit
+of *risk* — a quantity leverage cannot move. 100x and 10x with the same stop produce the
+same R and different margin. Expectancy in R is therefore the only expectancy worth gating
+on.
+
+### The defect that made the second claim unanswerable
+
+`TradeRecord.from_paper` reads every field off the trade object with a `getattr` default,
+so a field the producer does not define becomes `0.0` in the database with no exception
+anywhere. **`PaperTrade` did not define `r_multiple`.** Every paper trade ever stored
+therefore had `r_multiple = 0.0`, and since `compute()` averages that column into
+`expectancy_r`, a paper run of any size reported exactly zero expectancy. Because
+`Performance.verdict()` requires `expectancy_r > 0` to call an edge positive, a profitable
+paper run that reached the 1000-trade threshold could only ever have been graded
+**NEGATIVE**. `margin` and `liquidation_price` were lost the same way.
+
+The adapter had even computed the right denominator and thrown it away — a dead
+`risk = abs(entry - stop) * abs(size)` local, unused, and wrong regardless: it omits the
+contract's quanto multiplier, a factor of 10,000 on BTC. That is why the fix puts R at the
+*producer*, which knows the contract, rather than in the adapter, which does not. The
+adapter still stores `0.0` for a trade object that carries no R, deliberately — a
+plausible fiction would be worse than a visible zero, and the conduct check below treats
+an unmeasurable loss budget as a failed one rather than a satisfied one.
+
+Phase 12 missed this because the adapter's own test passes a hand-written stand-in that
+*does* define `r_multiple`. The stand-in was more complete than the real producer, so the
+test proved the adapter correct and told nobody the caller was broken.
+
+### The equity curve had no writer at all
+
+`record_equity` existed from Phase 11 and nothing outside the tests ever called it. With
+an empty curve, `drawdown_from_curve` returns `0.0`, so `--stats` reported "max drawdown
+0.00%" for every run — at 100x, the most flattering possible lie. `run_session` samples
+the curve through a new `on_step` hook on the existing `PaperTrader.run`, so the run being
+measured is the run that would have happened anyway. Samples are **mark-to-market**, not
+realised: the drawdown that decides survival arrives through an open position's mark price
+before any fill, and a curve built from `report.equity` alone cannot show it.
+
+### Withheld is not passed
+
+The verdict is three-valued and fails closed. Any conduct failure is `NOT VALIDATED` and
+is reported as a defect to fix rather than a strategy result to interpret. Below
+`backtest.min_trades_for_verdict` the edge is `WITHHELD` — the same threshold and the same
+refusal Phase 9 and Phase 11 already make, read from the same config key so the three
+cannot drift apart. A run that filled no entries passes every conduct check vacuously, so
+`exercised` exists to stop silence reading as success.
+
+Reading stored history is deliberately weaker than watching a run. The database records
+*outcomes*; three of the conduct properties are *events* — whether a position was ever
+carried unprotected, whether the ledger reconciles against an independent account figure,
+whether the run ended flat — and a trade table cannot testify to them either way. Those
+are withheld rather than assumed, which means `--validate` over history alone can never
+reach `VALIDATED`. What survives into the records is still checked: `stop_recorded`
+verifies every stored trade carries a stop on the losing side of its entry, and a
+`mode="live"` row in a database being read as paper validation fails `simulation_only`
+outright.
+
+### It cannot open the gate
+
+`ValidationReport` is a report. This module writes no config, sets no flag, and names no
+order verb; a test asserts the source contains no `DRY_RUN`, no `live_enabled =`, and no
+`os.environ`. A green verdict is an input to the Phase 14 decision and a human's, not a
+substitute for either.
+
+### Tests
+
+48 new tests, **1076 total**, no network. Coverage: R measured against Phase 9's
+definition including the quanto multiplier, the stored record keeping R/margin/liquidation
+price, a winning run no longer reporting zero expectancy, the adapter refusing to invent
+an R it cannot compute, every conduct check driven to FAIL and to PASS, an unmeasurable
+loss budget failing rather than passing, withheld-is-not-passed on a small sample, silence
+not reading as success, the one path that reaches VALIDATED still refusing to authorise,
+mark-to-market differing from realised equity while a position is open, the snapshot
+stride, persistence round-tripping R through SQLite, stored history withholding what it
+cannot prove, and a live-mode row failing simulation-only.
+
+**No real order was sent in this phase.** The new module imports the execution layer for a
+single `isinstance` check against `SimulatedGateway` and calls nothing on it.
+
+**Next: PHASE 14 — live readiness.** Not started; awaiting go-ahead.

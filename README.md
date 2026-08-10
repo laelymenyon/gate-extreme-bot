@@ -3,17 +3,18 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 12 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 13 of 14 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
 > liquidation protection, order execution, backtesting, paper trading, persistence,
-> logging, analytics, and a cross-layer test suite.
+> logging, analytics, a cross-layer test suite, and paper-trading validation.
 > The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
 > to at all*, and *whether the stop survives contact with liquidation*; it can place and
-> verify those orders, including the protective stop; and it now keeps an auditable record of
-> what it did and reports the result.
+> verify those orders, including the protective stop; it keeps an auditable record of
+> what it did and reports the result; and it can now **grade a paper run against explicit
+> acceptance criteria that are allowed to say no.**
 > **By default every order goes to an in-process simulator.** Reaching the real exchange
 > still requires all three safety switches to agree; miss any one and execution stays
-> simulated. **1028 tests pass, and no live order has ever been sent.**
+> simulated. **1076 tests pass, and no live order has ever been sent.**
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
 100x leverage means a 1 % adverse move against full margin is a total loss of that margin.
@@ -40,6 +41,7 @@ cp .env.example .env        # then fill in GATE_API_KEY / GATE_API_SECRET
 python main.py --status                      # config + safety gate state
 python main.py --positions                   # live account + open positions (needs API keys)
 python main.py --stats                       # performance analytics   (Phase 11)
+python main.py --validate                    # grade paper history     (Phase 13)
 python main.py --mode paper                  # paper trading loop      (Phase 10)
 python main.py --mode backtest               # backtest + walk-forward (Phase 10 wiring)
 python main.py --mode live --confirm-live    # real orders             (Phase 14)
@@ -549,6 +551,55 @@ to fail. A test that cannot fail is a comment.
 
 170 new tests, **1028 total**, no network and no real order.
 
+## What Phase 13 added — grading the paper run, and a defect that made it impossible
+
+The roadmap gates live trading on one sentence: paper trading must have **run correctly**,
+and the edge must **not merely be an artifact of leverage**. Those are two claims that fail
+in different ways, so this phase keeps them apart.
+
+- **"Ran correctly" is about the machine, not the money.** Answerable from a handful of
+  trades: was every filled entry protected, did anything get liquidated, did one loss
+  exceed what the sizer budgeted, does the ledger reconcile with the account, did the run
+  end flat. A run that *lost money* while obeying every invariant passes. A run that *made
+  money* while leaving one position unprotected does not. **None of these has a
+  configurable threshold** — a safety property you can tune off is not one.
+- **"Not an artifact of leverage" is about R.** Size is `risk / stop_distance`, so a
+  trade's R-multiple is what it earned per unit of *risk*, which leverage cannot move.
+  Expectancy in R is the only expectancy worth gating on.
+
+**Which is when the second claim turned out to be unanswerable.** `TradeRecord.from_paper`
+reads each field with a `getattr` default, and `PaperTrade` never defined `r_multiple` — so
+every paper trade ever stored had `r_multiple = 0.0`. `expectancy_r` is the mean of that
+column, and a positive verdict requires it above zero, so **a profitable paper run that
+reached the 1000-trade threshold could only ever have been graded NEGATIVE.** `margin` and
+`liquidation_price` vanished the same way. The adapter had even computed the right
+denominator and discarded it, in a dead local that was also wrong — it omits the quanto
+multiplier, a factor of 10,000 on BTC. R now comes from the producer, which knows the
+contract; the adapter still refuses to invent one, and an unmeasurable loss budget counts
+as a *failed* check rather than a satisfied one.
+
+Phase 12 missed it because the adapter's test passes a hand-written stand-in that *does*
+define `r_multiple`. The stand-in was more complete than the real producer.
+
+**The equity curve had no writer either.** `record_equity` shipped in Phase 11 and nothing
+outside the tests ever called it, so `--stats` reported "max drawdown 0.00%" for every run.
+Sessions now sample it **mark-to-market** — at 100x the drawdown that decides survival
+arrives through an open position's mark price, before any fill, and a curve built from
+realised equity cannot show it.
+
+**Withheld is not passed.** Below the 1000-trade threshold the edge is withheld, not
+graded — the same refusal Phase 9 and Phase 11 make, reading the same config key. A run
+that filled nothing passes every conduct check vacuously, so `exercised` stops silence
+reading as success. And reading stored history is deliberately weaker than watching a run:
+the database records outcomes, three conduct properties are events, and those are withheld
+rather than assumed — so `--validate` over history alone can never reach VALIDATED.
+
+**A pass is not permission.** The report writes no config and sets no flag; a test asserts
+the module's source contains no `DRY_RUN`, no `live_enabled =` and no `os.environ`.
+Enabling live trading is Phase 14's decision and a human's.
+
+48 new tests, **1076 total**, no network and no real order.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -571,7 +622,7 @@ exchange/   gate_client.py  websocket.py
 strategy/   indicators.py  signal_engine.py  regime.py  scoring.py
 risk/       risk_manager.py  position_sizer.py  liquidation_guard.py
 execution/  order_manager.py  protection.py
-paper/      loop.py
+paper/      loop.py  validation.py
 backtest/   engine.py
 database/   models.py
 monitoring/ logger.py  dashboard.py
@@ -580,7 +631,7 @@ tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicat
             test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
             test_execution.py  test_backtest.py  test_paper.py  test_monitoring.py
             conftest.py  test_integration.py  test_safety_audit.py
-            test_invariants.py  test_regressions.py  test_cli.py
+            test_invariants.py  test_regressions.py  test_cli.py  test_validation.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -600,7 +651,7 @@ docs/       ARCHITECTURE.md
 | 10 | Paper-trading loop (wiring the layers end to end) | **done** |
 | 11 | Persistence + logging + analytics (`database/`, `monitoring/`) | **done** |
 | 12 | Testing | **done** |
-| 13 | Paper trading validation | next |
+| 13 | Paper trading validation | **done** |
 | 14 | Live readiness | pending |
 
 Each phase must implement, pass tests, and be reviewed before the next begins. Live trading is not

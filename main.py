@@ -31,7 +31,7 @@ PHASES = [
     ("10", "Paper trading loop",          True),
     ("11", "Dashboard + database",         True),
     ("12", "Testing",                      True),
-    ("13", "Paper trading validation",     False),
+    ("13", "Paper trading validation",      True),
     ("14", "Live readiness",               False),
 ]
 
@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", action="store_true", help="Show config and safety state")
     parser.add_argument("--positions", action="store_true", help="Show open positions")
     parser.add_argument("--stats", action="store_true", help="Show performance analytics")
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Grade the stored paper history against the Phase 13 acceptance criteria",
+    )
     return parser
 
 
@@ -133,6 +138,29 @@ def show_stats(cfg) -> str:
     return Dashboard.from_config(cfg, store).render()
 
 
+def show_validation(cfg) -> str:
+    """Grade the stored paper history against the Phase 13 acceptance criteria.
+
+    Reads only. Session-scoped conduct properties are withheld rather than assumed here —
+    the database records outcomes, not events — so this path reports what the history
+    supports and never reaches VALIDATED on its own. Validating a *run* means watching
+    one: `paper.validation.run_session` then `validate`.
+    """
+    from database.models import TradeStore
+    from paper.validation import SessionEvidence, ValidationParams, validate
+
+    store = TradeStore.from_config(cfg)
+    evidence = SessionEvidence.from_store(store, cfg)
+    if not evidence.trades:
+        return (f"No paper trades recorded yet in {store.path}. Validation grades a "
+                "paper run's history; run one first.")
+    report = validate(
+        evidence, list(evidence.trades), list(evidence.curve),
+        params=ValidationParams.from_config(cfg),
+    )
+    return report.render()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -142,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    if args.status or args.positions or args.stats:
+    if args.status or args.positions or args.stats or args.validate:
         print_status(cfg)
         exit_code = 0
         if args.positions:
@@ -150,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.stats:
             print()
             print(show_stats(cfg))
+        if args.validate:
+            print()
+            print(show_validation(cfg))
         return exit_code
 
     print_status(cfg)
@@ -160,14 +191,17 @@ def main(argv: list[str] | None = None) -> int:
         print("No orders will be sent.")
 
     if args.mode == "paper":
-        print("\nPaper trading is implemented (paper/loop.py). Wiring it to live candles "
-              "needs a symbol and a data source;")
-        print("see tests/test_paper.py for a complete runnable example. No real order can "
-              "be placed: PaperTrader refuses to")
-        print("construct while the safety gate is open, and it only ever uses the "
-              "in-process simulator.")
+        print("\nPaper trading is implemented (paper/loop.py) and Phase 13 grades a run "
+              "against explicit acceptance")
+        print("criteria (paper/validation.py). Driving it needs a symbol and a data "
+              "source; see tests/test_validation.py")
+        print("for a complete runnable example, and --validate to grade the history a "
+              "run leaves behind.")
+        print("No real order can be placed: PaperTrader refuses to construct while the "
+              "safety gate is open, and it")
+        print("only ever uses the in-process simulator.")
     else:
-        print(f"\nPhases 1-12 complete. The '{args.mode}' engine arrives in a later "
+        print(f"\nPhases 1-13 complete. The '{args.mode}' engine arrives in a later "
               "phase; nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0

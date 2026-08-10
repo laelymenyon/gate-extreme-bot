@@ -259,6 +259,49 @@ def test_a_losing_history_is_reported_as_readily_as_a_winning_one(isolated_datab
     assert "-100.00" in out or "-100.0" in out
 
 
+# --- --validate -------------------------------------------------------------
+
+def test_validate_on_an_empty_database_explains_rather_than_failing(capsys):
+    """A fresh install has proved nothing. Same shape as `--stats` on an empty database."""
+    code, out = run(["--validate"], capsys)
+    assert code == 0
+    assert "No paper trades recorded yet" in out
+    assert "VALIDATED" not in out
+
+
+def test_validate_grades_stored_history_against_the_criteria(isolated_database, capsys):
+    """The `--validate` path end to end: real store, real grader, real render."""
+    store = TradeStore(isolated_database)
+    store.record_trade(sample_trade())
+    store.record_equity(EquityPoint(timestamp=NOW, equity=10_048.8))
+
+    code, out = run(["--validate"], capsys)
+    assert code == 0
+    assert "paper-trading validation" in out
+    # One trade is far below the verdict threshold, so the edge is withheld, not passed.
+    assert "sample_size" in out
+    assert "WITHHELD" in out
+
+
+def test_validate_withholds_the_checks_a_record_cannot_answer(isolated_database, capsys):
+    """Stored rows record outcomes, not events, so those checks are never claimed as passes."""
+    store = TradeStore(isolated_database)
+    store.record_trade(sample_trade())
+
+    _, out = run(["--validate"], capsys)
+    assert "stop_on_every_position" in out
+    assert "flat_at_end" in out
+    # Reading history alone must never reach a pass.
+    assert "VALIDATED — conduct was clean" not in out
+
+
+def test_validate_still_prints_the_safety_status_first(isolated_database, capsys):
+    """Same rule as `--stats`: the gate state sits above any verdict."""
+    TradeStore(isolated_database).record_trade(sample_trade())
+    _, out = run(["--validate"], capsys)
+    assert out.index("Trading gate") < out.index("paper-trading validation")
+
+
 # --- no CLI path trades -----------------------------------------------------
 
 def test_no_cli_invocation_can_reach_an_order_path(monkeypatch, capsys):

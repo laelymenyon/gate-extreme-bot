@@ -282,6 +282,18 @@ backtest:
     validation_pct: 0.25
     test_pct: 0.25
 
+# PHASE 13. Acceptance criteria for a paper run, before live trading is even considered.
+# Deliberately thin: the conduct checks (a stop on every position, no liquidation, the
+# ledger reconciling with the account, simulation-only) have NO thresholds here, because a
+# safety property that can be tuned off is not one. The sample-size and expectancy gates
+# reuse backtest.min_trades_for_verdict and risk.max_drawdown rather than restating them,
+# so the three phases that refuse on sample size cannot drift apart.
+validation:
+  # A stop-out costs 1R by construction. Slippage, fees and a gapped stop make the realised
+  # figure worse; beyond this the loss was not the one the sizer budgeted, which is a
+  # conduct failure rather than an unlucky trade. Must be >= 1.0.
+  max_loss_r: 1.5
+
 database:
   path: data/trades.db
   wal: true

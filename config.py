@@ -287,6 +287,23 @@ def _validate(cfg: Config) -> None:
     if not cfg.get("universe.symbols"):
         raise ConfigError("universe.symbols is empty; nothing to trade")
 
+    # --- PHASE 13: paper-trading acceptance criteria ----------------------
+    # Only the loss tolerance is configurable, and it cannot be set below the cost of a
+    # correctly-executed stop-out. A tolerance under 1R would fail every trade that did
+    # exactly what it was supposed to do, which would train an operator to ignore the
+    # report — the failure mode this check exists to prevent.
+    max_loss_r = cfg.get("validation.max_loss_r", 1.5)
+    if not isinstance(max_loss_r, (int, float)) or isinstance(max_loss_r, bool):
+        raise ConfigError(
+            f"validation.max_loss_r must be a number, got {max_loss_r!r}"
+        )
+    if max_loss_r < 1.0:
+        raise ConfigError(
+            f"validation.max_loss_r must be >= 1.0, got {max_loss_r}: a stop-out costs 1R "
+            "by construction, so a lower tolerance would fail every correctly-executed "
+            "losing trade"
+        )
+
     # --- consequences of running at pure 100x -----------------------------
     # At >=100x a taker entry costs ~1.2R in fees against the widest permissible stop,
     # which needs a ~73% win rate merely to break even. Post-only is not a preference here.

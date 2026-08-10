@@ -188,7 +188,15 @@ class PaperFill:
 
 @dataclass(frozen=True)
 class PaperTrade:
-    """A completed round trip in the paper account."""
+    """A completed round trip in the paper account.
+
+    The field list is deliberately a superset of what the loop itself needs: ``r_multiple``,
+    ``margin``, ``liquidation_price`` and ``funding`` exist because
+    :meth:`~database.models.TradeRecord.from_paper` reads them off whatever trade object it
+    is handed. A missing attribute there does not raise — it silently stores ``0.0`` — so a
+    field absent here becomes a zero in the audit trail and, for ``r_multiple``, a zero in
+    the expectancy that decides the verdict. Phase 13 found exactly that.
+    """
 
     symbol: str
     direction: int
@@ -205,6 +213,16 @@ class PaperTrade:
     equity_after: float
     score: float = 0.0
     fills: tuple[PaperFill, ...] = ()
+    #: Net PnL over the cash the stop put at risk — the same definition Phase 9 uses
+    #: (`backtest/engine.py`), so paper and backtest R are one number and comparable.
+    r_multiple: float = 0.0
+    #: Margin actually locked by the position, and the liquidation price the guard sized
+    #: against. Both are reported rather than recomputed downstream.
+    margin: float = 0.0
+    liquidation_price: float = 0.0
+    #: Always 0.0 on paper: no position is held across a funding stamp by this loop.
+    #: Present so the column exists and is honest rather than absent.
+    funding: float = 0.0
 
     @property
     def won(self) -> bool:
@@ -348,6 +366,34 @@ class PaperTrader:
         )
         return notional * rate
 
+    # --- observation (read-only) -------------------------------------------
+
+    @property
+    def open_position(self) -> Mapping[str, Any] | None:
+        """The position the loop currently carries, or None. Read-only."""
+        return self._position
+
+    def unrealised_pnl(self, mark: float) -> float:
+        """Open-position PnL at ``mark``. Zero when flat."""
+        position = self._position
+        if position is None:
+            return 0.0
+        coins = abs(int(position["remaining"])) * position["per_contract"]
+        return position["direction"] * (float(mark) - position["entry_price"]) * coins
+
+    def mark_to_market(self, mark: float | None = None) -> float:
+        """Equity including the open position's unrealised PnL.
+
+        ``report.equity`` only moves when something fills, so a curve built from it alone
+        is a curve of *realised* equity — and at 100x the drawdown that decides survival
+        arrives through an open position's mark price, before any fill (ARCHITECTURE §18).
+        Sampling this instead is what makes a recorded equity curve mean what the
+        dashboard claims it means.
+        """
+        if mark is None:
+            mark = self.source.mark_price(self.symbol)
+        return self.report.equity + self.unrealised_pnl(mark)
+
     # --- the step ----------------------------------------------------------
 
     async def step(self) -> PaperReport:
@@ -398,7 +444,7 @@ class PaperTrader:
             self.report.count(f"liq:{verdict.stage}")
             return self.report
 
-        await self._enter(plan, now, float(getattr(signal, "score", 0.0)))
+        await self._enter(plan, now, float(getattr(signal, "score", 0.0)), verdict)
         return self.report
 
     def _prices_this_step(self, mark: float) -> tuple[float, ...]:
@@ -422,7 +468,8 @@ class PaperTrader:
 
     # --- entry and protection ---------------------------------------------
 
-    async def _enter(self, plan: Any, now: float, score: float) -> None:
+    async def _enter(self, plan: Any, now: float, score: float,
+                     verdict: Any = None) -> None:
         self.report.entries_attempted += 1
         nonce = self._next_nonce()
 
@@ -489,6 +536,12 @@ class PaperTrader:
             "realised": 0.0,
             "score": score,
             "fills": [],
+            # Carried so the closed trade can report what it actually risked. The margin
+            # is the plan's; the liquidation price is the guard's own conservative figure,
+            # not a second derivation that could disagree with the one that authorised
+            # the trade.
+            "margin": float(getattr(plan, "margin", 0.0) or 0.0),
+            "liquidation_price": float(getattr(verdict, "liq_price", 0.0) or 0.0),
             "levels": {result.stop_order_id: ("stop", plan.stop.price)}
             | {leg.order_id: (leg.name, leg.price) for leg in result.take_profits
                if leg.order_id},
@@ -559,6 +612,17 @@ class PaperTrader:
         net = gross - fees
         last = fills[-1] if fills else None
 
+        # The cash the stop actually put at risk, by Phase 9's definition
+        # (`backtest/engine.py`): the stop distance over the size held, in coin terms.
+        # `per_contract` is what makes it currency rather than contracts — the quanto
+        # multiplier is not optional, and omitting it is wrong by a factor of 10,000 on
+        # BTC. Paper and backtest R are therefore the same measurement.
+        risk_amount = (
+            abs(position["entry_price"] - position["stop_price"])
+            * abs(int(position["size"]))
+            * position["per_contract"]
+        )
+
         trade = PaperTrade(
             symbol=self.symbol,
             direction=position["direction"],
@@ -575,6 +639,9 @@ class PaperTrader:
             equity_after=self.report.equity,
             score=position["score"],
             fills=fills,
+            r_multiple=net / risk_amount if risk_amount > 0 else 0.0,
+            margin=position["margin"],
+            liquidation_price=position["liquidation_price"],
         )
         self.report.trades.append(trade)
         self.risk.record_trade(now=now, pnl=net, equity=self.report.equity,
@@ -583,11 +650,20 @@ class PaperTrader:
 
     # --- driving -----------------------------------------------------------
 
-    async def run(self, steps: int | None = None, poll_seconds: float = 0.0) -> PaperReport:
-        """Step until the source runs out, or ``steps`` iterations have run."""
+    async def run(self, steps: int | None = None, poll_seconds: float = 0.0,
+                  on_step: Any = None) -> PaperReport:
+        """Step until the source runs out, or ``steps`` iterations have run.
+
+        ``on_step`` is called with this trader after every step, before the source
+        advances. It exists so an observer can sample state *during* the run — Phase 13
+        records the equity curve through it — without a second driving loop that could
+        advance the source differently from this one.
+        """
         taken = 0
         while steps is None or taken < steps:
             await self.step()
+            if on_step is not None:
+                on_step(self)
             taken += 1
             advance = getattr(self.source, "advance", None)
             if advance is not None and not advance():
