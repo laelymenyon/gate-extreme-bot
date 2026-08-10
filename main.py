@@ -32,7 +32,7 @@ PHASES = [
     ("11", "Dashboard + database",         True),
     ("12", "Testing",                      True),
     ("13", "Paper trading validation",      True),
-    ("14", "Live readiness",               False),
+    ("14", "Live readiness",                True),
 ]
 
 
@@ -54,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--validate",
         action="store_true",
         help="Grade the stored paper history against the Phase 13 acceptance criteria",
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Audit live readiness and report GO/NO-GO. Reads only; opens nothing",
     )
     return parser
 
@@ -161,6 +166,22 @@ def show_validation(cfg) -> str:
     return report.render()
 
 
+def show_preflight(cfg) -> str:
+    """Audit live readiness and report GO/NO-GO.
+
+    Offline by default: the account section reports "not read" rather than reaching for
+    the network, and "not read" blocks. Passing `--positions` alongside this reads the
+    account through the Phase 2 client, whose write-guard keeps that read-only.
+
+    This function authorises nothing. It cannot open the safety gate, and a GO still
+    leaves live trading behind all three switches.
+    """
+    from database.models import TradeStore
+    from execution.preflight import preflight
+
+    return preflight(cfg, TradeStore.from_config(cfg)).render()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -170,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    if args.status or args.positions or args.stats or args.validate:
+    if args.status or args.positions or args.stats or args.validate or args.preflight:
         print_status(cfg)
         exit_code = 0
         if args.positions:
@@ -181,14 +202,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.validate:
             print()
             print(show_validation(cfg))
+        if args.preflight:
+            print()
+            print(show_preflight(cfg))
         return exit_code
 
     print_status(cfg)
 
-    if args.mode == "live" and not cfg.live_enabled:
-        print("\nLive mode requested but the safety gate is CLOSED.")
-        print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
-        print("No orders will be sent.")
+    if args.mode == "live":
+        if not cfg.live_enabled:
+            print("\nLive mode requested but the safety gate is CLOSED.")
+            print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
+            print("No orders will be sent.")
+        # Phase 14 ships the readiness audit, not a live runner. Even with the gate open
+        # there is no code path here that places an order, and preflight reports why that
+        # is still the right state for this repository.
+        print()
+        print(show_preflight(cfg))
+        print("\nPhase 14 provides the readiness audit only. No live trading loop exists,")
+        print("so this command cannot send an order regardless of the switches above.")
 
     if args.mode == "paper":
         print("\nPaper trading is implemented (paper/loop.py) and Phase 13 grades a run "
@@ -201,8 +233,8 @@ def main(argv: list[str] | None = None) -> int:
               "safety gate is open, and it")
         print("only ever uses the in-process simulator.")
     else:
-        print(f"\nPhases 1-13 complete. The '{args.mode}' engine arrives in a later "
-              "phase; nothing was traded.")
+        print(f"\nAll 14 phases complete. The '{args.mode}' engine is not wired to a "
+              "runner; nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0
 

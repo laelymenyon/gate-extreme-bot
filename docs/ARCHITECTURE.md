@@ -1,7 +1,9 @@
 # PHASE 1 — Environment, Verified API Facts, Architecture
 
-Status: **PHASE 13 of 14 complete.** Phases 2-13 are documented in §§9-20 below; 1076 tests
-pass and **no live order has ever been sent.**
+Status: **PHASE 14 of 14 complete.** Phases 2-14 are documented in §§9-21 below; 1106 tests
+pass and **no live order has ever been sent.** Preflight (§21) currently returns NO-GO:
+no paper or backtest history has been accumulated, so the roadmap's precondition for live
+trading is unmet, and no live trading loop exists in this repository.
 All numbers below were pulled live from Gate.io on 2026-08-09, not from memory.
 
 ---
@@ -1574,4 +1576,102 @@ cannot prove, and a live-mode row failing simulation-only.
 **No real order was sent in this phase.** The new module imports the execution layer for a
 single `isinstance` check against `SimulatedGateway` and calls nothing on it.
 
-**Next: PHASE 14 — live readiness.** Not started; awaiting go-ahead.
+**Next: PHASE 14 — live readiness.** Complete; see §21.
+
+---
+
+## 21. PHASE 14 — live readiness (`execution/preflight.py`)
+
+Thirteen phases were built to refuse. This is the first whose success condition is
+*permitting* something, which makes it the one place where a mistake is expensive in the
+direction that matters. It is therefore an audit, not a switch: it reads state, compares it
+against conditions this repository already committed to, and returns GO or NO-GO. It has no
+way to open the safety gate — no flag, no environment write, no config mutation.
+
+### The conditions are not invented here
+
+README's roadmap already stated the rule:
+
+> Live trading is not enabled until paper trading has run correctly and backtesting shows
+> the edge is not merely an artifact of leverage.
+
+That sentence is the specification; this phase makes it executable. A precondition that
+lives only in prose is one that gets skipped at 2am by someone sure they remember it.
+Phase 13 already answers the first half — its conduct group asks whether the machine
+behaved, its evidence group whether the edge is real in R — so preflight *reads that
+answer* rather than recomputing it, and the two cannot disagree.
+
+The second half is measured over backtest history specifically, in R, because R is the unit
+leverage cannot move (§4, invariant 3). A 100x and a 10x run with the same stop produce the
+same R and different margin.
+
+### Unknown blocks, which is stricter than Phase 13
+
+There, `INSUFFICIENT` withheld a verdict and left conduct clean. Here it refuses outright.
+"We could not establish this" and "this is fine" must never share an outcome when the next
+step is real money at 100x, so a check that cannot be evaluated is a blocker and the report
+names the missing fact. `PreflightReport.ready` is `all(c.ok ...)` over a non-empty list —
+an empty report is not a pass either, since `all()` over nothing is `True`.
+
+### Reading stored history can never reach GO
+
+Three of Phase 13's conduct checks are *events*, not records: whether a position was ever
+carried unprotected, whether the ledger reconciles against an independent account figure,
+and whether the run ended flat. A trade table cannot testify to any of them, so
+`SessionEvidence.from_store` returns them `INSUFFICIENT` — which blocks here. Clearing them
+requires an **observed** validation report from a supervised paper run, passed in
+deliberately. That is the intended path to live, and it requires a human to have watched the
+thing run.
+
+A subtlety found while testing: preflight must **not** pass the current `cfg` into
+`SessionEvidence.from_store`. Preflight normally runs with the gate open, and doing so would
+report "the safety gate was OPEN during the run" about history gathered days earlier — a
+claim about the past derived from the present. Stored history's own evidence of live
+contamination is a `mode="live"` row, which that constructor already checks.
+
+### What else it audits
+
+- **gate** — the three switches as the operator set them, credentials, that martingale and
+  averaging-down are still off, and that entry TIF is still post-only at ≥100x. These are
+  enforced at config load; preflight re-reads them because it is the place that answers
+  "what is in force right now", and a reader should not have to trust that the loader ran
+  the check they care about.
+- **account** — reachable, funded, **flat**, and isolated margin. Starting flat is not a
+  preference: size, stop and liquidation distance all describe a position this bot opened,
+  so inheriting someone else's leaves every one of those numbers describing a position that
+  does not exist. Gate.io reports leverage `0` for cross margin, which this bot forbids.
+  The snapshot is a plain value object — preflight never touches the network itself; the
+  caller does the reads, which the Phase 2 write-guard already restricts to reads.
+- **risk** — the Phase 6 latches. A tripped breaker outlives the process, so it must outlive
+  a restart into live mode.
+
+### No live trading loop was built
+
+The phase is *readiness*, and this repository's own precondition is unmet — zero paper
+trades, zero backtest trades. A runner would be code the rules say must not execute.
+`--mode live` therefore runs the audit and reports; there is no code path here that sends a
+real order. `config.py`, `exchange/gate_client.py`, `execution/order_manager.py` and
+`execution/protection.py` are byte-identical after this phase.
+
+### It cannot open the gate
+
+A test parses the module's AST, strips docstrings so prose about `DRY_RUN` is not mistaken
+for behaviour, and asserts the executable code contains no environment write, no HTTP
+client, no order verb, and no assignment to `live_enabled`, `confirm_live`, `env_dry_run`,
+`run_mode` or `dry_run`. Further tests assert preflight mutates neither the config it was
+handed nor the database it read.
+
+### Tests
+
+30 new tests, **1106 total**, no network. Coverage: an empty database as NO-GO, each half of
+the roadmap sentence blocking independently, a losing backtest, a thin sample, stored
+history unable to reach GO, failed-vs-withheld reported distinctly, the shut gate described
+as the correct resting state, missing credentials, an unread and an unreachable account, an
+open position and a resting order, cross margin, an unfunded balance, Gate payload parsing,
+a tripped kill-switch, empty-report fail-closed, the single assembled path to GO, each
+condition removed in turn still refusing, and the three no-authority properties.
+
+Both load-bearing guards were mutation-checked: relaxing `ready` to ignore `INSUFFICIENT`
+fails 4 tests, and dropping the backtest-edge condition fails 2. Both mutants were reverted.
+
+**No real order was sent in this phase, and none can be: no live runner exists.**
