@@ -385,7 +385,20 @@ def resolve_stop(
                 f"{effective_ceiling * 100:.3f}% ceiling and on_sl_exceeds_max=skip",
                 atr_distance=atr_fraction, ceiling=effective_ceiling, method=method,
             )
-        distance = effective_ceiling
+        # Clamp to one tick *inside* the ceiling rather than onto it.
+        #
+        # The Phase 7 guard re-checks this stop against a liquidation price it rounds
+        # toward entry — its own conservative rule — which shortens the gap by up to one
+        # tick. Capping onto the ceiling exactly leaves nothing for that, so whether a
+        # maximally-capped stop survives the guard came down to where the last decimals
+        # landed: it passed most of the time and was vetoed intermittently, for no reason
+        # anyone chose. Reserving a tick here makes the two layers compose deterministically.
+        #
+        # The reserve costs a tick of stop room and moves the stop *closer* to entry, so it
+        # is the safe direction. ``ceiling`` still reports the true limit; only the distance
+        # actually used is pulled inside it.
+        reserve = float(price_tick) / entry_price if float(price_tick or 0) > 0 else 0.0
+        distance = max(params.min_distance, effective_ceiling - reserve)
         capped = True
 
     raw_price = entry_price * (1.0 - distance) if direction > 0 else entry_price * (1.0 + distance)

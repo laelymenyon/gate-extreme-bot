@@ -416,15 +416,17 @@ It drives the real stack — Phase 5 decides, Phase 6 sizes and halts, Phase 7 v
 `candles.head(i+1)`, the same call the live path makes. `execution/` and `exchange/` are not
 imported.
 
-**It found a defect at the Phase 6/7 seam.** The sizer caps a wide stop at *exactly* the
-liquidation ceiling; the guard then rounds liquidation toward entry and, on some prices,
-that consumes the last fraction of buffer and vetoes the plan. Both layers round the safe
-way and both are individually right; composed, acceptance of a maximally-capped stop depends
-on where the last decimals land. It is intermittent (~2 in 26 on the test fixture), pinned
-by a test, and documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 rather than
-fixed here — Phases 1–8 were left untouched.
+**It found a defect at the Phase 6/7 seam, and it is fixed.** The sizer capped a wide stop
+onto the liquidation ceiling *exactly*; the guard then rounds liquidation toward entry and,
+on some prices, that consumed the last fraction of buffer and vetoed the plan. Both layers
+rounded the safe way and both were individually right — composed, acceptance of a
+maximally-capped stop depended on where the last decimals landed (~2 in 26 on the original
+fixture). The sizer now caps one tick *inside* the ceiling, so the producer reserves the room
+the consumer's rounding needs and no Phase 7 check was loosened. 520 capped plans across four
+volatility regimes, zero vetoes. Details in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16.
 
-44 new tests, **756 total**, no network.
+47 new tests, **759 total**, no network.
 
 ## Core invariants
 

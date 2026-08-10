@@ -358,6 +358,40 @@ def test_wide_atr_is_capped_at_the_ceiling():
     assert result.stop.distance <= result.stop.ceiling + 1e-12
 
 
+def test_capping_reserves_a_tick_for_the_liquidation_guard():
+    """The stop is clamped a tick *inside* the ceiling, not onto it.
+
+    Phase 7 re-checks the stop against a liquidation price it rounds toward entry, which
+    shortens the gap by up to one tick. Capping onto the ceiling exactly left nothing for
+    that, so a maximally-capped stop was vetoed intermittently depending on where the last
+    decimals fell. The reserve costs a tick of stop room and moves the stop toward entry —
+    the safe direction — and makes the two layers compose deterministically.
+    """
+    result = plan(candles=candles(wobble(sigma=0.002)),
+                  contract=FakeContract(order_price_round=0.1))
+    assert result.ok and result.stop.capped
+    assert result.stop.ceiling == pytest.approx(0.00325)   # the true limit is reported
+    assert result.stop.distance < result.stop.ceiling      # the stop used sits inside it
+    reserved = result.stop.ceiling - result.stop.distance
+    assert 0 < reserved <= 2 * (0.1 / result.entry_price)
+
+
+def test_capping_without_a_price_grid_still_lands_on_the_ceiling():
+    """With no tick there is nothing to round, so nothing needs reserving."""
+    result = plan(candles=candles(wobble(sigma=0.002)),
+                  contract=FakeContract(order_price_round=0.0))
+    assert result.ok and result.stop.capped
+    assert result.stop.distance == pytest.approx(result.stop.ceiling)
+
+
+def test_the_reserve_never_pushes_the_stop_below_the_minimum_distance():
+    """On a coarse grid the reserve could otherwise undercut stop_loss.min_distance."""
+    result = plan(candles=candles(wobble(sigma=0.002)),
+                  contract=FakeContract(order_price_round=25.0))
+    if result.ok:
+        assert result.stop.distance >= SizingParams().min_distance - 1e-12
+
+
 def test_skip_refuses_where_cap_would_clamp():
     series = candles(wobble(sigma=0.002))
     capped = plan(candles=series, params=SizingParams(on_sl_exceeds_max="cap"))

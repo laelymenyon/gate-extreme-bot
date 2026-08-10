@@ -1159,30 +1159,42 @@ ignored the circuit breakers would measure a bot nobody would run. Decisions at 
 path. `execution/` and `exchange/` are not imported: a backtest that could reach the
 exchange is one that eventually will.
 
-### A defect this phase exposed at the Phase 6/7 seam
+### A defect this phase exposed at the Phase 6/7 seam — found here, fixed here
 
-Phase 6's `on_sl_exceeds_max: cap` clamps a wide ATR stop to *exactly* the liquidation
-ceiling, leaving 0.3000 %-and-change of buffer against the 0.30 % requirement. Phase 7 then
-rounds the predicted liquidation price toward entry — its own conservative rule — and on
-some prices that consumes the remaining fraction, vetoing the plan at the `buffer` stage
+Phase 6's `on_sl_exceeds_max: cap` clamped a wide ATR stop onto the liquidation ceiling
+*exactly*, leaving 0.3000 %-and-change of buffer against the 0.30 % requirement. Phase 7
+then rounds the predicted liquidation price toward entry — its own conservative rule — and
+on some prices that consumed the remaining fraction, vetoing the plan at the `buffer` stage
 with the fractional check already satisfied.
 
-Both layers are individually correct and both round the safe way. Composed, whether a
-maximally-capped stop is accepted depends on where the last few decimal places land, which
-is not a property anyone chose. It is **intermittent, not systematic** — roughly 2 of 26
-capped plans on the test fixture. `test_a_stop_capped_at_the_ceiling_can_be_vetoed_by_rounding_alone`
-pins the behaviour so a fix is deliberate. Phases 1-8 were left unmodified in this phase;
-the fix (either a tick of headroom in the sizer's cap, or a one-tick tolerance in the
-guard's price check) belongs to whoever picks it up next.
+Both layers were individually correct and both rounded the safe way. Composed, whether a
+maximally-capped stop was accepted depended on where the last few decimal places landed,
+which is not a property anyone chose. It was **intermittent, not systematic** — roughly 2 of
+26 capped plans on the original fixture.
+
+**Fix: the sizer now caps one tick *inside* the ceiling** (`risk/position_sizer.py`,
+`resolve_stop`). The producer reserves the room the consumer's rounding needs, so no Phase 7
+check was loosened — `risk/liquidation_guard.py` is unchanged. The reserve costs one tick of
+stop room and moves the stop *closer* to entry, which is the safe direction; `stop.ceiling`
+still reports the true limit, and only the distance actually used is pulled inside it. With
+no price grid there is nothing to round, so nothing is reserved, and the reserve can never
+push the stop below `stop_loss.min_distance`.
+
+Chosen over the alternative (a one-tick tolerance in the guard's price check) because a
+guard that accepts a stop a tick past its own limit is a guard that has to be re-argued
+every time someone reads it. Verified across four volatility regimes: **520 capped plans,
+zero vetoes**, where the same sweep previously vetoed intermittently.
 
 ### Tests
 
-44 new tests, **756 total**, no network. Coverage: unfilled and expired post-only entries,
+47 new tests, **759 total**, no network. Coverage: unfilled and expired post-only entries,
 stop-beats-target and liquidation-beats-stop within one bar, liquidation costing more than
 the stop, maker rebate versus taker entry, funding across 8-hour boundaries, slippage
 worsening exits, partial and final take-profits, short/long symmetry, reproducibility,
 drawdown measured from the running peak, R measured against actual risk, breakers firing,
-the chronological split, and the inconclusive verdict on a small sample.
+the chronological split, and the inconclusive verdict on a small sample. Three more pin the
+seam fix in `tests/test_position_sizer.py`, and one asserts capped plans now survive the
+guard across four volatility regimes.
 
 **No order was sent and no socket was opened in this phase.**
 

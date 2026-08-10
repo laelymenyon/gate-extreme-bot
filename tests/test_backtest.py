@@ -393,62 +393,68 @@ def test_the_phase_6_breakers_halt_the_backtest():
     assert halted, f"expected a breaker to fire, saw {result.rejections}"
 
 
-def test_a_stop_capped_at_the_ceiling_can_be_vetoed_by_rounding_alone():
-    """A live seam finding, pinned here rather than left as folklore.
+def test_a_capped_stop_always_survives_the_liquidation_guard():
+    """Regression: the Phase 6/7 seam defect this phase originally exposed.
 
-    Phase 6's ``on_sl_exceeds_max: cap`` clamps a wide ATR stop to *exactly* the
-    liquidation ceiling, leaving 0.3000%-and-change of buffer against a 0.30% requirement.
-    Phase 7 then rounds the predicted liquidation price toward entry — its own conservative
-    rule — and on some prices that consumes the remaining fraction, so the plan is vetoed.
+    Phase 6's ``on_sl_exceeds_max: cap`` used to clamp a wide ATR stop onto the liquidation
+    ceiling *exactly*, leaving 0.3000%-and-change against the 0.30% requirement. Phase 7
+    then rounds the predicted liquidation price toward entry — its own conservative rule —
+    which shortens the gap by up to a tick. With nothing reserved for that, whether a
+    maximally-capped stop survived came down to where the last decimals landed: it passed
+    most of the time and was vetoed intermittently, for no reason anyone chose.
 
-    Both layers are individually correct and both round the safe way. Composed, whether a
-    maximally-capped stop is accepted depends on where the last few decimal places land,
-    which is not a property anyone chose. It is **intermittent**, not systematic: roughly
-    2 of 26 capped plans on this fixture. See ARCHITECTURE §16 — recorded so that a fix is
-    deliberate rather than accidental.
+    The sizer now caps a tick *inside* the ceiling. Both layers still round the safe way,
+    and they compose deterministically. See ARCHITECTURE §16.
     """
     from risk.liquidation_guard import LiquidationParams, TierSnapshot, assess_plan
     from risk.position_sizer import plan_position
 
-    series = candles(wobble(n=900, sigma=0.0006))
-    capped, vetoed = [], []
-    for index in range(250, len(series), 25):
-        plan = plan_position(
-            symbol="BTC_USDT", direction=1, entry_price=float(series.close[index]),
-            candles=series.head(index + 1), contract=BTC, tiers=TIERS,
-            equity=10_000.0, available=10_000.0, params=SizingParams(),
-        )
-        if not (plan.ok and plan.stop.capped):
-            continue
-        capped.append(plan)
-        verdict = assess_plan(plan, TierSnapshot.of("BTC_USDT", tuple(TIERS), 1e6), 1e6,
-                              params=LiquidationParams(), contract=BTC)
-        if not verdict.ok:
-            vetoed.append(verdict)
+    capped = vetoed = 0
+    for sigma in (0.0006, 0.001, 0.002, 0.004):
+        series = candles(wobble(n=900, sigma=sigma))
+        for index in range(250, len(series), 5):
+            plan = plan_position(
+                symbol="BTC_USDT", direction=1, entry_price=float(series.close[index]),
+                candles=series.head(index + 1), contract=BTC, tiers=TIERS,
+                equity=10_000.0, available=10_000.0, params=SizingParams(),
+            )
+            if not (plan.ok and plan.stop.capped):
+                continue
+            capped += 1
+            verdict = assess_plan(
+                plan, TierSnapshot.of("BTC_USDT", tuple(TIERS), 1e6), 1e6,
+                params=LiquidationParams(), contract=BTC,
+            )
+            if not verdict.ok:
+                vetoed += 1
 
-    assert capped, "fixture must produce capped stops"
-    assert vetoed, "the rounding interaction should veto at least one capped plan"
-    assert len(vetoed) < len(capped), "and it is intermittent, not systematic"
-
-    for verdict in vetoed:
-        assert verdict.stage == "buffer"
-        assert "mark-price grid" in verdict.reason
-        # The fractional buffer was satisfied; only the price-grid check failed, so the
-        # shortfall is rounding rather than a real breach of the liquidation buffer.
-        assert verdict.buffer_actual >= verdict.buffer_required
+    assert capped > 100, f"fixture must exercise the cap, saw {capped}"
+    assert vetoed == 0, f"{vetoed} of {capped} capped plans were vetoed by rounding alone"
 
 
-def test_a_capped_stop_shows_up_as_a_liquidation_veto_in_the_replay():
+def test_the_cap_stays_inside_the_ceiling_but_still_reports_it():
+    """The reserve is one tick and moves the stop toward entry — the safe direction."""
+    from risk.position_sizer import plan_position
+
+    series = candles(wobble(n=400, sigma=0.002))
+    index = len(series) - 1
+    plan = plan_position(
+        symbol="BTC_USDT", direction=1, entry_price=float(series.close[index]),
+        candles=series.head(index + 1), contract=BTC, tiers=TIERS,
+        equity=10_000.0, available=10_000.0, params=SizingParams(),
+    )
+    assert plan.ok and plan.stop.capped
+    assert plan.stop.ceiling == pytest.approx(0.00325)      # the true limit is unchanged
+    assert plan.stop.distance < plan.stop.ceiling           # but the stop sits inside it
+    # One tick of BTC's 0.1 price grid, no more.
+    reserved = plan.stop.ceiling - plan.stop.distance
+    assert 0 < reserved <= 2 * (0.1 / plan.entry_price)
+    assert plan.stop.price > plan.entry_price * (1 - plan.stop.ceiling)
+
+
+def test_a_capped_stop_is_no_longer_rejected_in_the_replay():
     result = run(candles(wobble(n=1400, sigma=0.0006)), decide=lambda **kw: Signal(1))
-    assert result.rejections.get("liq:buffer", 0) > 0
-
-
-def test_sizing_comes_from_the_phase_6_sizer():
-    result = run(candles(wobble()), decide=once(at=1))
-    trade = result.trades[0]
-    risk = abs(trade.entry_price - trade.stop_price) * abs(trade.size) * 0.0001
-    budget = BacktestParams().starting_equity * SizingParams().risk_per_trade
-    assert risk <= budget * 1.001
+    assert result.rejections.get("liq:buffer", 0) == 0
 
 
 # --- walk-forward ----------------------------------------------------------
