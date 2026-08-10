@@ -527,12 +527,16 @@ def test_the_manager_cannot_place_or_close_anything():
     assert not [n for n in names if any(word in n.lower() for word in forbidden)]
 
 
-def test_liquidation_guard_is_still_a_phase_7_stub():
-    """Phase 6 must not start Phase 7."""
-    with pytest.raises(NotImplementedError, match="Phase 7"):
-        importlib.import_module("risk.liquidation_guard")
-    source = Path("risk/liquidation_guard.py").read_text(encoding="utf-8")
-    assert "PHASE 7" in source
+def test_execution_has_not_started():
+    """Phase 7 landed the liquidation guard; execution is still Phase 10.
+
+    This is the moving boundary marker: it named Phase 7 while the guard was a stub, and
+    now names the next unimplemented layer. Nothing in the repo may place an order.
+    """
+    importlib.import_module("risk.liquidation_guard")     # Phase 7: implemented
+    for module in ("execution.order_manager", "execution.protection"):
+        with pytest.raises(NotImplementedError):
+            importlib.import_module(module)
 
 
 def test_every_refusal_names_a_breaker_and_explains_itself():

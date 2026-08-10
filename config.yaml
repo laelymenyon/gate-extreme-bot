@@ -102,6 +102,15 @@ protection:
   # likely to reach liq_price before the stop fills. This buffer is protection, not immunity.
   liquidation_buffer: 0.003    # 0.30% minimum gap between SL and liquidation price
   verify_liq_price: true       # re-read liq_price from exchange after fill; mismatch -> flatten
+  # PHASE 7. Tier ladders change rarely but they do change, and a guard reasoning from a
+  # stale ladder is reasoning about a different contract. Older than this -> refuse and
+  # re-read /risk_limit_tiers rather than fall back to the flat maintenance_rate.
+  risk_tier_max_age_seconds: 3600
+  # How far the exchange's own liq_price may differ from the predicted one, as a fraction
+  # of entry, before the position is treated as not the one that was sized. 0.20% is wide
+  # enough for Gate's own rounding and funding accrual, tight enough that a wrong tier or
+  # an unapplied leverage setting shows up.
+  liq_price_tolerance: 0.002
   move_to_breakeven: true
   breakeven_trigger_r: 1.0     # move SL to BE once +1R
   breakeven_fee_buffer: 0.0009 # ~0.085% round-trip fee + slippage pad, so BE is truly break-even

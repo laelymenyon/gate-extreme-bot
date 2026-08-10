@@ -262,6 +262,24 @@ def _validate(cfg: Config) -> None:
     if cfg.get("protection.sl_price_type") not in ("mark", "last", "index"):
         raise ConfigError("protection.sl_price_type must be mark, last, or index")
 
+    # --- PHASE 7: liquidation guard inputs --------------------------------
+    # A tier ladder with no freshness limit, or a mismatch tolerance wide enough to admit
+    # a wrong tier, would turn the guard's fail-closed behaviour into a formality.
+    age = cfg.get("protection.risk_tier_max_age_seconds", 3600)
+    if not isinstance(age, (int, float)) or isinstance(age, bool) or age <= 0:
+        raise ConfigError(
+            f"protection.risk_tier_max_age_seconds must be a positive number, got {age!r}"
+        )
+    tolerance = cfg.get("protection.liq_price_tolerance", 0.002)
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
+        raise ConfigError("protection.liq_price_tolerance must be a number")
+    if not 0.0 <= tolerance < cfg.get("protection.liquidation_buffer"):
+        raise ConfigError(
+            f"protection.liq_price_tolerance ({tolerance}) must be in "
+            f"[0, liquidation_buffer): a tolerance at or above the buffer would accept a "
+            "liq_price that eats the entire buffer"
+        )
+
     tp = cfg.section("take_profit")
     if tp["tp1_close_pct"] + tp["tp2_close_pct"] >= 1.0:
         raise ConfigError("take_profit tp1+tp2 close fractions must leave a runner (< 1.0)")
