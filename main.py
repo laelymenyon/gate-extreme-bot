@@ -30,7 +30,7 @@ PHASES = [
     ("9",  "Backtesting",                  True),
     ("10", "Paper trading loop",          True),
     ("11", "Dashboard + database",         True),
-    ("12", "Testing",                      False),
+    ("12", "Testing",                      True),
     ("13", "Paper trading validation",     False),
     ("14", "Live readiness",               False),
 ]
@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         print("construct while the safety gate is open, and it only ever uses the "
               "in-process simulator.")
     else:
-        print(f"\nPhases 1-11 complete. The '{args.mode}' engine arrives in a later "
+        print(f"\nPhases 1-12 complete. The '{args.mode}' engine arrives in a later "
               "phase; nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0

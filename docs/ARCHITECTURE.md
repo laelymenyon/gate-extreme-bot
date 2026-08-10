@@ -1,6 +1,6 @@
 # PHASE 1 — Environment, Verified API Facts, Architecture
 
-Status: **PHASE 11 of 14 complete.** Phases 2-11 are documented in §§9-18 below; 858 tests
+Status: **PHASE 12 of 14 complete.** Phases 2-12 are documented in §§9-19 below; 1028 tests
 pass and **no live order has ever been sent.**
 All numbers below were pulled live from Gate.io on 2026-08-09, not from memory.
 
@@ -1374,4 +1374,105 @@ matching Phase 9, nothing annualised, and the report surfacing a tripped breaker
 **No real order was sent in this phase.** The only new I/O is a local SQLite file and a log
 file.
 
-**Next: PHASE 12 — testing.** Not started; awaiting go-ahead.
+**Next: PHASE 12 — testing.** Complete; see §19.
+
+---
+
+## 19. PHASE 12 — testing (`tests/conftest.py`, `tests/test_*.py`)
+
+Eleven phases each tested their own module, and all 858 tests passed. A suite in that shape
+answers "is each layer correct?" and never asks "do the layers agree?" — and this repo had
+already shipped a defect of the second kind. Commit `bd7977c` fixed a sizer that capped a
+stop onto the liquidation ceiling the guard then rounded past: both layers individually
+right, composed into an intermittent veto that depended on where decimals landed.
+
+This phase tests what no single phase owns.
+
+### The suite is offline by construction, not by convention
+
+Every phase note since Phase 2 ends with "no network". Nothing enforced it. The tests inject
+fake sessions and scripted sockets, and each phase's author remembered to — but this machine
+has working internet, so one forgotten fake would have reached the public API from a suite
+whose whole safety argument is that it cannot.
+
+`tests/conftest.py` installs an **autouse** fixture that patches `socket.connect`,
+`connect_ex`, `create_connection` and the three resolver entry points. Any outbound
+connection or hostname lookup raises `NetworkUseInTests`, naming the address. Loopback and
+`AF_UNIX` are left alone — asyncio's self-pipe needs them, and blocking those would break
+the event loop rather than any exchange call. Autouse is the point: it covers tests written
+later by someone who never read this file.
+
+Verified by probe rather than by assertion — a throwaway test making a real `aiohttp` call
+to `api.gateio.ws` was confirmed blocked, then deleted.
+
+### What the seams cover
+
+- **`test_integration.py`** — the composed stack with the real objects on *both* sides of
+  each seam: the shipped `SignalEngine` into the real sizer, the sizer into the real guard,
+  the guard against the simulator's own `liq_price`, the protection engine's ladder against
+  what the exchange ends up holding. It also closes a seam nothing had tested: Phase 10
+  produces `PaperTrade`s and Phase 11 stores `TradeRecord`s, but no test had ever run a
+  paper loop and put its output in the database — which is exactly what `--stats` reads.
+- **`test_safety_audit.py`** — the repo-wide version of the claim each phase made locally.
+  All eight switch combinations driven through the real `Config`, the real write-guard and
+  the real `OrderManager`; every state-changing REST method **enumerated from the client's
+  own source via AST**, so a write method added later is audited automatically instead of
+  being silently exempt; and "cannot trade" asserted structurally — by import graph and
+  attribute surface — for every non-trading module.
+- **`test_invariants.py`** — the six README invariants over a hostile grid: prices from
+  0.41 to 97,531, volatility from dead to violent, both directions, four account sizes.
+  128 accepted plans, half of them with stops capped at the ceiling, which is the risky case.
+- **`test_regressions.py`** — every defect this repo has shipped, pinned so it fails when
+  the **fix** is reverted. That is a different property from what the original tests
+  assert. The post-only entry is the clearest example: `test_paper.py` asserts
+  `limit <= entry + 1e-9`, which an at-the-mark entry — the defect — satisfies comfortably.
+- **`test_cli.py`** — `main.py` had no tests at all, despite being the only file a user
+  runs and the one that decides from argv whether real orders are permitted. Exit codes
+  (`2` config refusal, `1` API error, `0` clean), the gate display's agreement with the
+  resolved config across all eight combinations, and the phase table's agreement with the
+  README roadmap.
+
+### A real defect, found by the sweep
+
+The sizer→guard sweep caught a plan the sizer accepted and the guard rejected as
+`stop_side`. `_tick_toward_entry` rounds a stop onto the price grid **toward entry**, which
+is the safe direction — but when the entry price is itself off the grid and the tick is
+wide relative to the 0.325 % stop, "toward entry" overshoots to the *far side* of it. At
+entry 9.37 on a 0.1 tick, the stop lands at 9.40: a long holding a stop **above** its own
+entry. The distance was then computed as `abs(entry - stop)`, which reported the inversion
+as a healthy 0.32 %, so `plan.ok` was `True` and `max_loss` was derived from a nonsense
+number.
+
+The Phase 7 guard would have caught it, and did. But relying on the downstream check means
+the invariant holds only where that check runs, and every layer between them had already
+been handed a plan whose risk arithmetic was meaningless. `resolve_stop` now checks the
+side on the price, before deriving a distance from it, and refuses with `price_grid` naming
+the entry and the tick. **No guard was loosened**; the producer refuses instead.
+
+This is the same shape as `bd7977c` — a rounding rule that is locally safe and composes
+badly — which is the argument for testing seams rather than adding more per-layer cases.
+
+### Every assertion was mutation-checked
+
+A regression test that cannot fail is a comment. Each load-bearing assertion here was
+verified by reintroducing the defect and confirming the failure: the post-only entry
+resubmitted at the mark (2 failures), the `reduce_only` clamp removed (3), the three-switch
+gate collapsed to one switch (14), the size flooring changed to a ceiling (1), the status
+display hard-coded to LIVE (3), and the config-error exit code changed to 0 (2). All
+mutants were reverted; `git diff` covers only `risk/position_sizer.py`.
+
+### Tests
+
+170 new tests, **1028 total**, no network. Coverage: the offline guard itself, sizer→guard
+composition swept across prices and volatilities, signal→sizer sign conventions, the risk
+manager and sizer spending one budget, a full paper round trip with equity reconciling to
+the trade ledger, paper→database→dashboard, backtest and paper history in one comparable
+table, kill-switch persistence through a rebuilt loop, a clock predating persisted state
+refusing fail-closed, all eight switch combinations across three layers, every write method
+behind the guard, no-order-path for eleven modules, the six invariants swept, six shipped
+defects pinned against reversion, and the CLI's exit codes and gate reporting.
+
+**No real order was sent in this phase.** The only new file that runs at import time is a
+test fixture that blocks sockets.
+
+**Next: PHASE 13 — paper trading validation.** Not started; awaiting go-ahead.

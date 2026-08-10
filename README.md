@@ -3,17 +3,17 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 11 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 12 of 14 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
 > liquidation protection, order execution, backtesting, paper trading, persistence,
-> logging, analytics.
+> logging, analytics, and a cross-layer test suite.
 > The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
 > to at all*, and *whether the stop survives contact with liquidation*; it can place and
 > verify those orders, including the protective stop; and it now keeps an auditable record of
 > what it did and reports the result.
 > **By default every order goes to an in-process simulator.** Reaching the real exchange
 > still requires all three safety switches to agree; miss any one and execution stays
-> simulated. **858 tests pass, and no live order has ever been sent.**
+> simulated. **1028 tests pass, and no live order has ever been sent.**
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
 100x leverage means a 1 % adverse move against full margin is a total loss of that margin.
@@ -504,6 +504,51 @@ a test asserts it.
 
 61 new tests, **858 total**, no network.
 
+## What Phase 12 added — testing the seams, not the layers again
+
+Phases 2-11 each tested their own module and passed. That is not the same as the layers
+agreeing with each other, and this repo had already shipped one defect of exactly that
+kind (`bd7977c`): the sizer capped a stop onto the liquidation ceiling that the guard then
+rounded past, so two individually-correct layers composed into an intermittent veto.
+
+So this phase tests what no single phase owns:
+
+- **The suite is now offline by construction.** Every phase claimed "no network"; nothing
+  enforced it, and this machine can reach the internet. `tests/conftest.py` installs an
+  autouse guard that fails any test opening a socket or resolving a hostname. Verified by
+  probe: a real `aiohttp` call to the live Gate.io endpoint is blocked before it leaves.
+- **Cross-layer integration** (`test_integration.py`) — the composed stack with the real
+  objects on both sides of each seam, including the Phase 10 → 11 handoff that nothing
+  tested: a paper run's own trades stored and rendered through the real dashboard, which is
+  the path `--stats` uses.
+- **A repo-wide safety audit** (`test_safety_audit.py`) — all eight switch combinations
+  driven through the real config, the real write-guard and the real order manager; every
+  state-changing REST method enumerated *from the source* so a method added later cannot
+  quietly skip the guard; and the no-order-path property asserted structurally for every
+  non-trading module.
+- **The six core invariants, swept** (`test_invariants.py`) — over a deliberately hostile
+  grid (prices across five orders of magnitude, dead to violent volatility, both
+  directions, four account sizes) rather than the one fixture that made each convenient.
+- **Regressions for defects actually shipped** (`test_regressions.py`) — each pinned so it
+  fails when the *fix* is reverted, which is not what the original tests asserted. The
+  post-only entry is the clearest case: the Phase 10 test allows `limit <= mark`, which the
+  defect satisfies.
+- **The CLI** (`test_cli.py`) — `main.py` had no tests at all. Exit codes, the gate
+  display's agreement with the resolved config, and the phase table's agreement with this
+  README.
+
+**It found one real defect.** The sizer→guard sweep caught a plan the guard rejected as
+`stop_side`: where the entry price is off the order grid and the tick is wide relative to
+the stop, rounding "toward entry" overshot to the *far side* of it — a long holding a stop
+**above** its own entry, reported as healthy because the distance calculation takes an
+absolute value. `resolve_stop` now checks the side on the price before deriving a distance
+from it, and refuses with `price_grid`. No guard was loosened to accommodate it.
+
+Each new assertion was mutation-checked: the defect was reintroduced and the test confirmed
+to fail. A test that cannot fail is a comment.
+
+170 new tests, **1028 total**, no network and no real order.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -534,6 +579,8 @@ tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicat
             test_regime.py  test_scoring.py  test_signal_engine.py
             test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
             test_execution.py  test_backtest.py  test_paper.py  test_monitoring.py
+            conftest.py  test_integration.py  test_safety_audit.py
+            test_invariants.py  test_regressions.py  test_cli.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -552,8 +599,8 @@ docs/       ARCHITECTURE.md
 | 9 | Backtesting + walk-forward | **done** |
 | 10 | Paper-trading loop (wiring the layers end to end) | **done** |
 | 11 | Persistence + logging + analytics (`database/`, `monitoring/`) | **done** |
-| 12 | Testing | next |
-| 13 | Paper trading validation | pending |
+| 12 | Testing | **done** |
+| 13 | Paper trading validation | next |
 | 14 | Live readiness | pending |
 
 Each phase must implement, pass tests, and be reviewed before the next begins. Live trading is not

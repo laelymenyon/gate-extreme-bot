@@ -497,6 +497,69 @@ def test_a_price_grid_too_coarse_for_a_stop_is_refused():
     assert stop.stage == "price_grid"
 
 
+# --- PHASE 12: the stop must land on the correct side of entry -------------
+
+@pytest.mark.parametrize("entry,tick", [
+    (9.37, 0.1),        # the case the Phase 12 composition sweep surfaced
+    (0.4137, 0.01),
+    (137.0, 5.0),
+])
+@pytest.mark.parametrize("direction", [1, -1])
+def test_rounding_never_puts_the_stop_on_the_wrong_side_of_entry(entry, tick, direction):
+    """Regression: an entry off the price grid could round the stop past entry.
+
+    ``_tick_toward_entry`` rounds toward entry, which is the safe direction — but when the
+    entry price is itself off the grid and the tick is wide relative to the 0.325 % stop,
+    "toward entry" overshoots to the *far side* of it. A long would then hold a stop above
+    its own entry: not a stop at all, but an instant-triggering exit that the distance
+    calculation reported as healthy, because it takes an absolute value.
+
+    Found by the Phase 12 sizer→guard sweep, where the Phase 7 guard rejected a plan the
+    sizer had approved (``stop_side``). The guard was right. The sizer now refuses first.
+    """
+    series = candles(flat(price=entry), wick=0.0005)
+    stop = resolve_stop(series, direction, entry, ceiling=0.00325,
+                        params=SizingParams(), price_tick=tick)
+
+    if stop.ok:
+        assert (stop.price < entry) if direction > 0 else (stop.price > entry), (
+            f"a {'long' if direction > 0 else 'short'} stop at {stop.price:g} is on the "
+            f"wrong side of entry {entry:g}"
+        )
+        assert stop.distance > 0
+    else:
+        assert stop.stage == "price_grid"
+        assert np.isnan(stop.price)
+
+
+def test_the_overshooting_grid_is_refused_rather_than_silently_inverted():
+    """The exact case, pinned as itself: entry 9.37 on a 0.1 tick.
+
+    ``9.37 × (1 − 0.325%) = 9.3396``, which rounds up to ``9.40`` — above the entry. The
+    refusal names the grid, so an operator sees a contract whose tick is too coarse for the
+    stop rather than a mysterious rejection downstream.
+    """
+    series = candles(flat(price=9.37), wick=0.0005)
+    stop = resolve_stop(series, +1, 9.37, ceiling=0.00325, params=SizingParams(),
+                        price_tick=0.1)
+    assert not stop.ok
+    assert stop.stage == "price_grid"
+    assert "past the entry price" in stop.reason
+
+
+def test_a_plan_on_an_overshooting_grid_carries_no_size():
+    """The refusal has to survive to `plan_position`, not stop at `resolve_stop`."""
+    series = candles(flat(price=9.37), wick=0.0005)
+    result = plan_position(
+        symbol="BTC_USDT", direction=1, entry_price=9.37, candles=series,
+        contract=FakeContract(order_price_round=0.1), tiers=[FakeTier(1, 500_000, 0.003)],
+        equity=10_000.0, available=10_000.0, params=SizingParams(),
+    )
+    assert not result.ok
+    assert result.stage == "price_grid"
+    assert result.size == 0
+
+
 # --- lookahead -------------------------------------------------------------
 
 def test_as_of_equals_replaying_on_a_truncated_series():

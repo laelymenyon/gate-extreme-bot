@@ -408,15 +408,24 @@ def resolve_stop(
             "price_grid", f"stop price {stop_price!r} is not a usable price",
             atr_distance=atr_fraction, ceiling=effective_ceiling, method=method,
         )
-    distance = abs(entry_price - stop_price) / entry_price
-
-    if distance <= 0:
+    # Rounding toward entry can land *on* the entry, and — when the entry price is itself
+    # off the order grid and the tick is wide relative to the stop — can overshoot to the
+    # far side of it, which would put a long's stop above its entry. The distance below is
+    # an absolute value and would report that inversion as a healthy positive number, so
+    # the side is checked here, on the price, before the distance is derived from it.
+    if (direction > 0 and stop_price >= entry_price) or (
+        direction < 0 and stop_price <= entry_price
+    ):
         return _no_stop(
             "price_grid",
-            f"the stop rounds onto the entry price at a tick of {price_tick:g}; there is "
-            "no room for a stop on this price grid",
+            f"the stop rounds onto or past the entry price at a tick of {price_tick:g} "
+            f"(entry {entry_price:g}, rounded stop {stop_price:g}); there is no room for a "
+            "stop on this price grid",
             atr_distance=atr_fraction, ceiling=effective_ceiling, method=method,
         )
+
+    distance = abs(entry_price - stop_price) / entry_price
+
     if distance < params.min_distance - _FLOAT_SLOP:
         return _no_stop(
             "price_grid",
