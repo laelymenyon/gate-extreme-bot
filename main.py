@@ -1,7 +1,8 @@
 """gate-extreme-bot — CLI entry point.
 
-PHASE 1 scaffold. Trading engines are not implemented yet; every run mode
-reports its readiness state and exits. No orders can be placed by this file.
+CLI scaffold. The strategy, risk, execution and backtest layers are built, but
+nothing is wired into a run loop yet — every run mode reports its readiness state
+and exits. No orders can be placed by this file.
 
     python main.py --status
     python main.py --mode paper
@@ -26,7 +27,7 @@ PHASES = [
     ("6",  "Risk manager",                 True),
     ("7",  "Liquidation protection",       True),
     ("8",  "Order execution",             True),
-    ("9",  "Backtesting",                  False),
+    ("9",  "Backtesting",                  True),
     ("10", "Paper trading loop",          False),
     ("11", "Dashboard + database",         False),
     ("12", "Testing",                      False),
@@ -145,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
         print("No orders will be sent.")
 
-    print(f"\nPhases 1-8 complete. The '{args.mode}' engine arrives in a later phase; "
+    print(f"\nPhases 1-9 complete. The '{args.mode}' engine arrives in a later phase; "
           "nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0

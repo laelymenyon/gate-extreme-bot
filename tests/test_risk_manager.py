@@ -530,14 +530,14 @@ def test_the_manager_cannot_place_or_close_anything():
 def test_the_next_phase_has_not_started():
     """The moving boundary marker: what is built, and what is still a stub.
 
-    It named Phase 7 while the liquidation guard was a stub and Phase 8 while execution
-    was. Phase 8 landed the order layer, so it now names the backtester. Live orders still
-    require all three safety switches; the execution layer defaults to simulation.
+    It has named the liquidation guard, then execution, then the backtester as each
+    landed; it now names the database and dashboard. Live orders still require all three
+    safety switches, and the execution layer defaults to simulation.
     """
     for built in ("risk.liquidation_guard", "execution.order_manager",
-                  "execution.protection"):
+                  "execution.protection", "backtest.engine"):
         importlib.import_module(built)
-    for pending in ("backtest.engine", "database.models"):
+    for pending in ("database.models", "monitoring.dashboard"):
         with pytest.raises(NotImplementedError):
             importlib.import_module(pending)
 

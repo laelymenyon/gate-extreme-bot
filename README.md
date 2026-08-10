@@ -3,9 +3,9 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 8 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 9 of 14 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
-> liquidation protection, order execution.
+> liquidation protection, order execution, backtesting.
 > The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
 > to at all*, and *whether the stop survives contact with liquidation* — and it can place and
 > verify those orders, including the protective stop.
@@ -39,7 +39,7 @@ python main.py --status                      # config + safety gate state
 python main.py --positions                   # live account + open positions (needs API keys)
 python main.py --stats                       # performance analytics   (Phase 11)
 python main.py --mode paper                  # paper trading loop      (Phase 10)
-python main.py --mode backtest               # backtest + walk-forward (Phase 9)
+python main.py --mode backtest               # backtest + walk-forward (Phase 10 wiring)
 python main.py --mode live --confirm-live    # real orders             (Phase 14)
 ```
 
@@ -386,6 +386,46 @@ protected?" after a restart or reconnect.
 
 64 new tests, **712 total**, no network — every one against the simulator.
 
+## What Phase 9 added — the backtester
+
+`backtest/engine.py`. Its job is to produce a number that is **allowed to say no**: a
+backtester that flatters a strategy is worse than none, because it converts an unprofitable
+idea into a funded one. Every modelling choice resolves against the strategy.
+
+**Intrabar order is adverse.** A bar is four numbers, not a path. When the stop and a target
+both lie inside one bar, the stop is taken; when liquidation is in there too, it goes first.
+The optimistic reading of the same bar is what turns a losing system into a winning
+backtest, and it is invisible in the output.
+
+**Post-only entries do not always fill.** The entry rests at the signal bar's close and
+fills only if a later bar trades through it. Assuming fills would hand the strategy the
+maker rebate for free — the biggest single lever on whether any of this is profitable.
+
+**Costs are charged, not estimated away**: maker rebate in, taker out, funding at every
+8-hour boundary, slippage on every taker exit — but not on a liquidation, where the venue
+takes the position at its own price. Liquidation is simulated, and a test asserts the
+liquidated exit loses strictly more than the stopped one.
+
+**The verdict refuses below 1000 trades.** Thirty trades cannot distinguish a 40 % win rate
+from a 55 % one, so the engine reports INCONCLUSIVE however good the numbers look. Profit
+factor comes back as `inf` rather than a big number when nothing was lost, because "too few
+losses to judge" is the honest reading. `walk_forward()` splits chronologically 50/25/25 and
+flags **OVERFIT** when training is positive and out-of-sample is not.
+
+It drives the real stack — Phase 5 decides, Phase 6 sizes and halts, Phase 7 vetoes — using
+`candles.head(i+1)`, the same call the live path makes. `execution/` and `exchange/` are not
+imported.
+
+**It found a defect at the Phase 6/7 seam.** The sizer caps a wide stop at *exactly* the
+liquidation ceiling; the guard then rounds liquidation toward entry and, on some prices,
+that consumes the last fraction of buffer and vetoes the plan. Both layers round the safe
+way and both are individually right; composed, acceptance of a maximally-capped stop depends
+on where the last decimals land. It is intermittent (~2 in 26 on the test fixture), pinned
+by a test, and documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 rather than
+fixed here — Phases 1–8 were left untouched.
+
+44 new tests, **756 total**, no network.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -414,7 +454,7 @@ monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
             test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
-            test_execution.py
+            test_execution.py  test_backtest.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -430,8 +470,8 @@ docs/       ARCHITECTURE.md
 | 6 | Risk manager (sizing + circuit breakers) | **done** |
 | 7 | Liquidation protection (tiered mmr + buffer guard) | **done** |
 | 8 | Order execution + protection (`execution/`) | **done** |
-| 9 | Backtesting + walk-forward | next |
-| 10 | Paper-trading loop (wiring the layers end to end) | pending |
+| 9 | Backtesting + walk-forward | **done** |
+| 10 | Paper-trading loop (wiring the layers end to end) | next |
 | 11 | Dashboard + database | pending |
 | 12 | Testing | pending |
 | 13 | Paper trading validation | pending |

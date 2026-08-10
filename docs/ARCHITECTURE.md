@@ -1110,4 +1110,80 @@ gate defaulting to simulation.
 **No live order was sent in this phase**: the shipped config keeps the gate shut, so every
 test ran against the in-process simulator.
 
-**Next: PHASE 9 — backtesting + walk-forward.** Not started; awaiting go-ahead.
+**Next: PHASE 9 — backtesting + walk-forward.** Complete; see §16.
+
+---
+
+## 16. PHASE 9 — the backtester (`backtest/engine.py`)
+
+The job of this module is to produce a number that is **allowed to say no**. A backtester
+that flatters a strategy is worse than none, because it converts an unprofitable idea into
+a funded one. Every modelling choice here therefore resolves against the strategy.
+
+### Four assumptions, each chosen to be pessimistic
+
+1. **Intrabar order is adverse.** A bar is four numbers, not a path. When both the stop and
+   a take-profit lie inside one bar's range, the stop is taken; when the liquidation price
+   is also inside it, liquidation is taken first of all. The optimistic reading of the same
+   bar is what turns a losing system into a winning backtest, and it is undetectable in the
+   output.
+2. **Post-only entries do not always fill.** The entry rests at the signal bar's close and
+   fills only if a later bar trades through it, within `entry_fill_timeout_seconds`.
+   Assuming fills would hand the strategy the maker rebate for free — the single largest
+   lever on profitability at these stop widths (§5).
+3. **Fees and funding are charged.** Maker rebate on entry, taker on every exit, funding on
+   the open notional at each 8-hour boundary crossed. A liquidation pays no slippage,
+   because the venue takes the position at its own price rather than filling an order.
+4. **Liquidation is simulated.** At 100x the gap between stop and liquidation is 0.30 %, so
+   a jumped stop is not hypothetical; when it happens the loss is the margin, not the
+   planned R. A test asserts the liquidated exit loses strictly more than the stopped one.
+
+### The verdict is allowed to refuse
+
+Below `backtest.min_trades_for_verdict` (1000) the engine reports **INCONCLUSIVE** and says
+so in the result, however good the numbers look. Thirty trades cannot distinguish a 40 %
+win rate from a 55 % one, and quoting a profit factor from that sample is how a backtest
+lies without a single wrong number in it. Profit factor is reported as `inf` rather than a
+large number when nothing was lost, because "too few losses to judge" is the honest reading.
+
+`walk_forward()` splits **chronologically** 50/25/25 — shuffling bars would let a window
+learn from its own future — and flags `degraded` when training is positive and
+out-of-sample is not. That combination has a name, and the verdict uses it: *OVERFIT*.
+
+### It drives the real stack
+
+Decisions come from the Phase 5 engine, sizing from the Phase 6 sizer, the Phase 7 guard
+vetoes on the liquidation buffer, and the Phase 6 breakers halt the run — a backtest that
+ignored the circuit breakers would measure a bot nobody would run. Decisions at bar *i* use
+`candles.head(i+1)`, the same call the live path makes, so replay and live remain one code
+path. `execution/` and `exchange/` are not imported: a backtest that could reach the
+exchange is one that eventually will.
+
+### A defect this phase exposed at the Phase 6/7 seam
+
+Phase 6's `on_sl_exceeds_max: cap` clamps a wide ATR stop to *exactly* the liquidation
+ceiling, leaving 0.3000 %-and-change of buffer against the 0.30 % requirement. Phase 7 then
+rounds the predicted liquidation price toward entry — its own conservative rule — and on
+some prices that consumes the remaining fraction, vetoing the plan at the `buffer` stage
+with the fractional check already satisfied.
+
+Both layers are individually correct and both round the safe way. Composed, whether a
+maximally-capped stop is accepted depends on where the last few decimal places land, which
+is not a property anyone chose. It is **intermittent, not systematic** — roughly 2 of 26
+capped plans on the test fixture. `test_a_stop_capped_at_the_ceiling_can_be_vetoed_by_rounding_alone`
+pins the behaviour so a fix is deliberate. Phases 1-8 were left unmodified in this phase;
+the fix (either a tick of headroom in the sizer's cap, or a one-tick tolerance in the
+guard's price check) belongs to whoever picks it up next.
+
+### Tests
+
+44 new tests, **756 total**, no network. Coverage: unfilled and expired post-only entries,
+stop-beats-target and liquidation-beats-stop within one bar, liquidation costing more than
+the stop, maker rebate versus taker entry, funding across 8-hour boundaries, slippage
+worsening exits, partial and final take-profits, short/long symmetry, reproducibility,
+drawdown measured from the running peak, R measured against actual risk, breakers firing,
+the chronological split, and the inconclusive verdict on a small sample.
+
+**No order was sent and no socket was opened in this phase.**
+
+**Next: PHASE 10 — paper-trading loop.** Not started; awaiting go-ahead.
