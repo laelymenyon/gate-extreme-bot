@@ -1,6 +1,7 @@
 # PHASE 1 — Environment, Verified API Facts, Architecture
 
-Status: **PHASE 1 only.** No trading logic implemented yet.
+Status: **PHASE 11 of 14 complete.** Phases 2-11 are documented in §§9-18 below; 858 tests
+pass and **no live order has ever been sent.**
 All numbers below were pulled live from Gate.io on 2026-08-09, not from memory.
 
 ---
@@ -1271,4 +1272,106 @@ reproducibility.
 
 **No real order was sent in this phase.**
 
-**Next: PHASE 11 — dashboard + database.** Not started; awaiting go-ahead.
+**Next: PHASE 11 — persistence, logging, analytics.** Complete; see §18.
+
+---
+
+## 18. PHASE 11 — persistence, logging, analytics (`database/`, `monitoring/`)
+
+Phases 2-10 built a bot that can decide and act. This phase makes what it did **auditable
+after the process exits**: the trade history, the log of why setups were skipped, and the
+metric set that judges the result. Nothing here decides anything and nothing here can place
+an order — `database/models.py`, `monitoring/logger.py` and `monitoring/dashboard.py` import
+neither `exchange` nor `execution` nor `aiohttp`, and a test reads their import lines to
+prove it.
+
+### The trade record stores the reasoning, not only the outcome
+
+`TradeRecord` carries the §21 field list, and `signal_score`, `market_regime` and
+`exit_reason` are columns rather than log lines. The question worth asking after a losing
+week is not "how much" but "which setups, in which regime, at what score"; a schema that
+stores only PnL cannot answer it. `fees` stays separate from `pnl` because fee drag is the
+dominant cost at these stop widths (§5) and folding it into PnL would make it unauditable.
+`TradeRecord.from_paper` adapts both a Phase 10 `PaperTrade` and a Phase 9 `Trade`, so paper
+and backtest history are comparable in one table.
+
+**Append-only.** There is no `update_trade` and no `delete`. A record that can be edited is
+not an audit trail.
+
+**One file, shared with the breakers.** The store writes to `database.path` in WAL mode
+alongside the `risk_state` and `kill_switches` tables that `SqliteRiskStore` owns (§13). A
+restart has to recover the tripped breakers *and* the history that justifies them, and two
+files can disagree. Every statement is `IF NOT EXISTS`; this module reads the kill-switch
+rows to report them and never writes them.
+
+**The equity curve is a separate table.** At 100x, drawdown can arrive through an open
+position's mark price without any trade closing — the same reason Phase 6 observes equity on
+every call — so a curve reconstructed from closed trades understates the worst moment.
+Snapshots are appended independently, and a test pins that the curve-based drawdown exceeds
+the trade-only view.
+
+### Redaction is a filter, not a convention
+
+`SecretRedactor` is attached to the `gate` logger rather than to a handler, so every
+destination inherits it, including one added later. It scrubs the message, the args and the
+extras, walks nested containers, and masks by key name (`sign`, `secret`, `token`, …)
+whatever the value is. It also redacts anything *shaped* like a credential — a hex run of 32
+or more — even when that value was never registered, because the failure mode being
+prevented is an operator pasting a log into an issue tracker.
+
+`logging.redact_secrets: false` is parsed and then **not honoured**; it logs a warning
+instead. A switch that turns redaction off is a switch that eventually gets left off, and the
+cost is a leaked API key. Values shorter than 8 characters are not registered — masking them
+would redact ordinary words and train the reader to ignore the marker.
+
+Format follows destination: `JsonFormatter` to file, one object per line, because the file is
+what gets grepped after a bad day; `ConsoleFormatter` to stdout for a person watching.
+Neither is derived from the other by parsing.
+
+**`log_skip` records the stage that refused.** A score-80 filter over six categories and four
+timeframes rejects almost everything by design (§7), so "did nothing" is the normal outcome
+and the reason is the primary signal, not noise.
+
+### The metrics refuse to flatter a small sample
+
+`compute()` returns the §22 set — win/loss rate, profit factor, expectancy in cash *and* in
+R, average and largest win/loss, max consecutive losses, gross/net PnL, fees, funding, daily
+PnL, liquidations, drawdown, peak equity, total return, and tallies by regime and exit
+reason. Three deliberate choices:
+
+- **Empty input yields NaN, not zero.** A win rate of 0.0 means every trade lost; "no trades"
+  means nothing was learned. Collapsing the second into the first is how an untested strategy
+  reads as a catastrophic one, or worse, the reverse.
+- **Profit factor with no losses is `inf`**, not a large number, so it cannot be read as
+  quality when it is really a sample-size statement.
+- **`liquidation_distance_pct` returns NaN on unusable input.** An unknown distance must not
+  read as a comfortable one.
+
+`Performance.verdict()` reuses Phase 9's `backtest.min_trades_for_verdict` (1000) and returns
+`INCONCLUSIVE` below it rather than calling an edge. A negative verdict says so plainly:
+*leverage would only lose it faster*. `Dashboard.render()` prints losses with the same
+prominence as wins, appends any tripped kill-switch, and annualises nothing.
+
+### Wiring
+
+`main.py --stats` builds `TradeStore.from_config` and renders the dashboard, and explains
+that an empty database is what a paper or backtest run has yet to fill rather than an error.
+The phase table in `main.py` marks 11 complete; `--mode live` still refuses without all three
+switches.
+
+### Tests
+
+61 new tests, **858 total**, no network. Coverage: schema and WAL creation, a missing
+directory, reopening without wiping, coexistence with the risk store, kill-switches read but
+never written, every field round-tripping, chronological ordering, symbol and time filters,
+history surviving a restart, curve-based drawdown beating the trade-only view, both trade
+adapters, registered/env/config/shape-based redaction, redaction that cannot be switched off,
+nested secrets, whole-record scrubbing, JSON-per-line and exception capture, idempotent setup,
+skip staging, NaN on empty input, infinite profit factor, drawdown from the running peak,
+daily PnL, liquidation tallies, the inconclusive/positive/negative verdicts, the threshold
+matching Phase 9, nothing annualised, and the report surfacing a tripped breaker.
+
+**No real order was sent in this phase.** The only new I/O is a local SQLite file and a log
+file.
+
+**Next: PHASE 12 — testing.** Not started; awaiting go-ahead.

@@ -3,15 +3,17 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 10 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 11 of 14 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
-> liquidation protection, order execution, backtesting, paper trading.
+> liquidation protection, order execution, backtesting, paper trading, persistence,
+> logging, analytics.
 > The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
-> to at all*, and *whether the stop survives contact with liquidation* — and it can place and
-> verify those orders, including the protective stop.
+> to at all*, and *whether the stop survives contact with liquidation*; it can place and
+> verify those orders, including the protective stop; and it now keeps an auditable record of
+> what it did and reports the result.
 > **By default every order goes to an in-process simulator.** Reaching the real exchange
 > still requires all three safety switches to agree; miss any one and execution stays
-> simulated.
+> simulated. **858 tests pass, and no live order has ever been sent.**
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
 100x leverage means a 1 % adverse move against full margin is a total loss of that margin.
@@ -458,6 +460,50 @@ doing nothing and that should be visible rather than hidden.
 
 38 new tests, **797 total**, no network.
 
+## What Phase 11 added — persistence, logging, analytics
+
+`database/models.py`, `monitoring/logger.py`, `monitoring/dashboard.py`. The run now outlives
+the process: what was traded, why it was traded, and what it cost.
+
+**The trade record stores the reasoning, not just the PnL.** Signal score, market regime and
+exit reason are columns rather than log lines, because the question worth asking after a
+losing week is not "how much" but "which setups, in which regime, at what score" — a schema
+that only records PnL cannot answer it. The store is append-only: there is no `update_trade`
+and no `delete`. It shares the one SQLite file the Phase 6 kill-switches already use, so a
+restart recovers the tripped breakers *and* the history that justifies them from one place;
+two files could disagree.
+
+**The equity curve is stored separately from the trades.** At 100x a drawdown can arrive
+through an open position's mark price without any trade closing, so a curve reconstructed
+from closed trades understates the worst moment. Snapshots are appended independently.
+
+**Redaction is a filter, not a convention.** `GATE_API_KEY`, `GATE_API_SECRET` and the `SIGN`
+header are stripped from every record — message, args and extras alike — by a filter attached
+to the logger rather than by discipline at the call sites, so a handler added later inherits
+it. It also redacts anything *shaped* like a key (a long hex run) that was never registered,
+because the failure mode being prevented is an operator pasting a log into an issue tracker.
+`logging.redact_secrets=false` is parsed and then ignored with a warning: a switch that turns
+off redaction is a switch that eventually gets left off. JSON to file, human-readable to
+console, neither derived from the other by parsing.
+
+**Skips are logged, not swallowed.** The bot is designed to reject almost everything, so
+"3400 bars, 3390 skipped at the regime stage" *is* the finding — and without the stage that
+refused, it is unactionable.
+
+**Empty input yields NaN, never zero.** A win rate of 0.0 means every trade lost; "no trades"
+means nothing was learned, and collapsing the second into the first is how an untested
+strategy reads as a catastrophic one — or worse, the reverse. Profit factor with no losses is
+`inf`, not a large number. `--stats` shows losses with the same prominence as wins, surfaces
+tripped kill-switches, reports liquidation distance (the number that decides survival at
+100x, and not derivable from PnL), and — reusing Phase 9's threshold — refuses a verdict
+below 1000 trades instead of dressing a small sample as an edge. Nothing is annualised or
+extrapolated.
+
+Storage and reporting only: no module here imports `exchange`, `execution` or `aiohttp`, and
+a test asserts it.
+
+61 new tests, **858 total**, no network.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -487,7 +533,7 @@ monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
             test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
-            test_execution.py  test_backtest.py  test_paper.py
+            test_execution.py  test_backtest.py  test_paper.py  test_monitoring.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -505,8 +551,8 @@ docs/       ARCHITECTURE.md
 | 8 | Order execution + protection (`execution/`) | **done** |
 | 9 | Backtesting + walk-forward | **done** |
 | 10 | Paper-trading loop (wiring the layers end to end) | **done** |
-| 11 | Dashboard + database | next |
-| 12 | Testing | pending |
+| 11 | Persistence + logging + analytics (`database/`, `monitoring/`) | **done** |
+| 12 | Testing | next |
 | 13 | Paper trading validation | pending |
 | 14 | Live readiness | pending |
 
