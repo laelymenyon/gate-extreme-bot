@@ -752,7 +752,7 @@ Two modules that decide *how much* and *whether at all*. Phase 5 decides directi
 decides size and permission, and stops there. Neither module imports `exchange/` — contracts and
 risk tiers arrive as structural `Protocol`s — so there is still no network path and no
 order-placing path anywhere in the repo. `risk/liquidation_guard.py` is untouched and still
-raises `NotImplementedError("Phase 7 not implemented")`; a test pins that.
+raised `NotImplementedError("Phase 7 not implemented")` at this point; it landed in §14.
 
 ```
 position_sizer.py  plan_position(...) -> PositionPlan    how many contracts, and where is the stop?
@@ -888,4 +888,104 @@ state, and the absence of any `exchange` import in either module.
 
 **No order was sent in this phase.**
 
-**Next: PHASE 7 — liquidation protection.** Not started; awaiting go-ahead.
+**Next: PHASE 7 — liquidation protection.** Complete; see §14.
+
+---
+
+## 14. PHASE 7 — the liquidation guard (`risk/liquidation_guard.py`)
+
+The most safety-critical module in the repo. Everything else being wrong costs a trade; this
+being wrong costs the margin, because at 100x the distance from entry to liquidation is 0.625 %
+on BTC and 0.425 % on everything else — a single bad candle wide. One rule:
+
+> **Liquidation is never a stop-loss.**
+
+A position may exist only when its protective stop sits at least `protection.liquidation_buffer`
+clear of the liquidation price, measured against the **mark** series, because that is the series
+liquidation is computed from.
+
+```
+liq_distance ~= 1/leverage - maintenance_rate - taker_fee
+```
+
+### The maintenance rate is the trap, so a bare rate is not accepted
+
+Gate.io's contract-level `maintenance_rate` is only tier 1. BTC_USDT has 19 tiers and the rate
+climbs 0.30 % → 0.35 % → 0.45 % with notional while `leverage_max` *falls* (200x at tier 1 down
+to 50x at tier 8). Reading the flat field understates liquidation risk precisely when the
+position is large enough for it to matter — the trap first identified in Phase 2 and guarded
+again in Phase 6.
+
+`assess()` therefore takes a `TierSnapshot` — tiers plus the time they were read — and never a
+bare rate. There is no default maintenance rate anywhere in the module. The consequence is
+visible in one test: the same 0.325 % stop **passes at tier 1 and is refused at tier 5**.
+
+| notional | tier | mmr | liq distance | widest stop |
+|---|---|---|---|---|
+| 100 k | 1 | 0.30 % | 0.625 % | **0.325 %** |
+| 2 M | 5 | 0.50 % | 0.425 % | **0.125 %** |
+
+### Fail-closed is the whole design
+
+Each of these refuses, naming the stage that refused: no snapshot · empty ladder · snapshot older
+than `protection.risk_tier_max_age_seconds` · snapshot timestamped in the future beyond clock
+skew · a non-finite or out-of-range `maintenance_rate`, `risk_limit` or `leverage_max` · a
+**non-monotonic ladder** (Gate's ladders climb in notional and rate while leverage falls; anything
+else is corrupt or unrecognised) · cross margin · leverage above the ceiling · a tier whose own
+`leverage_max` is below the configured leverage · notional past the top tier's limit · a stop on
+the wrong side of entry.
+
+Refusing costs an opportunity. Guessing costs the margin.
+
+### Rounding is conservative in exactly one direction
+
+The predicted liquidation price snaps onto the contract's mark-price grid **toward entry**, so a
+rounded prediction is never further from entry than the truth. Rounding away would widen the
+apparent buffer by up to a tick — not negligible when the entire buffer is 0.30 % of price. The
+buffer is then checked twice: once as a fraction, once in price terms against that pessimistic
+figure. A coarse grid can turn a fractional pass into a refusal, and a test pins that.
+
+### The top-up solver still runs
+
+`required_effective_leverage()` solves `1/L - mmr - taker >= stop + buffer`. At the shipped
+0.30 % buffer a 0.50 % stop on BTC needs **85.1x**; the 72.7x in §4 is the same solve against the
+original 0.50 % buffer. With `allow_margin_topup: false` the figure only informs skip-vs-trade —
+nothing here posts margin — but a refusal reports how far short it was rather than merely that it
+was short.
+
+### After the fill, the exchange has the last word
+
+An API response is not proof. The fill may have slipped, the leverage may not have applied, the
+position may have landed in a stricter tier than planned — each moves liquidation without moving
+the stop. `verify_fill()` re-checks the exchange's **own** `liq_price` and returns
+`action="flatten"` when it is missing, on the wrong side of entry, inside the buffer, beyond the
+stop, reported under cross margin (`leverage=0`), or drifting from the prediction by more than
+`protection.liq_price_tolerance`.
+
+That is a **recommendation**. This module closes nothing; acting on it is Phase 10.
+
+### Integration, and what did not change
+
+`assess_plan()` consumes the Phase 6 `PositionPlan` and re-derives the buffer independently from
+the plan's *final* numbers, so a sizing bug surfaces as a refusal rather than as a position.
+Nothing in Phases 1-6 was modified — `position_sizer.py`, `risk_manager.py`, `strategy/` and
+`exchange/` are untouched. Contracts and tiers arrive as the same structural protocols Phase 6
+defined, so the guard imports no `exchange` module: still no network path and no order-placing
+path anywhere in the repo.
+
+Two new config keys, both validated fail-closed: `protection.risk_tier_max_age_seconds` (3600) and
+`protection.liq_price_tolerance` (0.002, which must sit strictly inside the buffer — a tolerance at
+or above it would accept a `liq_price` that eats the entire buffer).
+
+### Tests
+
+94 new tests, **648 total**, no network. Coverage: the liquidation formula at 100/125/200x, both
+stop ceilings, the buffer boundary from both sides on both maintenance tiers, tier selection at
+every `risk_limit` edge and agreement with the Phase 2 client, a stop that fits at tier 1 and not
+at tier 5, leverage ceilings and per-tier caps, liquidation-on-entry, every missing/stale/future/
+invalid/non-monotonic tier-data path, grid rounding in both directions, long/short symmetry,
+Phase 6 plan integration including the re-derivation catch, and every `verify_fill` failure mode.
+
+**No order was sent in this phase.**
+
+**Next: PHASE 8 — paper trading.** Not started; awaiting go-ahead.

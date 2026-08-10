@@ -3,10 +3,12 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 6 of 14 complete.** Environment, REST client, market-data feed, indicators,
-> regime detection, signal scoring, signal engine, position sizing, circuit breakers.
-> The bot can now decide *whether* to trade, *which way*, *how much*, and *whether it is
-> allowed to at all*. It cannot act on any of that: execution begins in Phase 10.
+> **Status: PHASE 7 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> regime detection, signal scoring, signal engine, position sizing, circuit breakers,
+> liquidation protection.
+> The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is
+> allowed to at all*, and *whether the stop survives contact with liquidation*. It cannot act
+> on any of that: execution begins in Phase 10.
 > **Nothing in this repo can place an order.**
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
@@ -236,7 +238,7 @@ survive win above the ~40 % break-even rate is a Phase 9 question.
 
 `risk/position_sizer.py` and `risk/risk_manager.py`. Neither imports `exchange/` — contracts and
 risk tiers arrive as structural protocols — so there is still no network path and no order path.
-`risk/liquidation_guard.py` remains a Phase 7 stub, and a test pins that.
+`risk/liquidation_guard.py` was still a Phase 7 stub at this point; it landed in Phase 7 below.
 
 **Size comes from risk, never from leverage.** `size = (equity × risk.per_trade) / stop_distance`,
 floored to whole contracts. At 20x and 100x the same setup gives the same size, the same stop and
@@ -281,6 +283,50 @@ cooldown follows every trade, 300 s after a loss against 60 s after a win.
 
 131 new tests (56 sizing + 68 risk + 7 config), **554 total**, no network.
 
+## What Phase 7 added — the liquidation guard
+
+`risk/liquidation_guard.py`, the most safety-critical module in the repo. Everything else being
+wrong costs a trade; this being wrong costs the margin. One rule: **liquidation is never a
+stop-loss.** A position may exist only when its stop clears the liquidation price by
+`protection.liquidation_buffer`, measured on the **mark** series, because that is what liquidation
+is priced off.
+
+**A bare maintenance rate is not accepted.** `assess()` takes a `TierSnapshot` — the tier ladder
+plus the time it was read — and resolves the tier from actual notional. There is no default
+maintenance rate anywhere in the module. The consequence shows up in one test: the same 0.325 %
+stop **passes at tier 1 (100 k notional, mmr 0.30 %) and is refused at tier 5** (2 M, mmr 0.50 %,
+so the widest stop is 0.125 %). Reading Gate's flat contract field would have missed exactly that.
+
+**Fail-closed everywhere.** No snapshot, an empty ladder, one older than an hour, one timestamped
+in the future, a non-finite field, a **non-monotonic ladder**, cross margin, leverage above the
+ceiling, a tier whose own `leverage_max` is below the configured leverage, notional past the top
+tier, or a stop on the wrong side of entry — each refuses naming the stage that refused. Refusing
+costs an opportunity; guessing costs the margin.
+
+**Rounding is conservative in one direction only.** The predicted liquidation price snaps onto the
+mark-price grid *toward entry*, so it is never optimistic — rounding away would widen the apparent
+buffer by up to a tick, which is not negligible when the whole buffer is 0.30 % of price. The
+buffer is checked twice, once as a fraction and once in price terms against that pessimistic
+figure, and a coarse grid can turn a fractional pass into a refusal.
+
+**The exchange has the last word after the fill.** An API response is not proof: the fill may have
+slipped, the leverage may not have applied, the position may have landed in a stricter tier — each
+moves liquidation without moving the stop. `verify_fill()` re-reads the exchange's own `liq_price`
+and returns `action="flatten"` when it is missing, wrong-sided, inside the buffer, beyond the stop,
+reported under cross margin (`leverage=0`), or drifting past `liq_price_tolerance` from the
+prediction. That is a recommendation — this module closes nothing.
+
+**The top-up solver still runs.** At the shipped 0.30 % buffer a 0.50 % stop on BTC needs 85.1x
+effective leverage (the 72.7x in ARCHITECTURE §4 is the same solve against the original 0.50 %
+buffer). With `allow_margin_topup: false` that figure only informs skip-vs-trade, but a refusal
+reports how far short it was rather than merely that it was short.
+
+`assess_plan()` consumes the Phase 6 `PositionPlan` and re-derives the buffer from its final
+numbers, so a sizing bug surfaces as a refusal rather than a position. Phases 1–6 are untouched,
+and the guard imports no `exchange` module.
+
+94 new tests, **648 total**, no network.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -308,7 +354,7 @@ database/   models.py
 monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
-            test_position_sizer.py  test_risk_manager.py
+            test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -322,8 +368,8 @@ docs/       ARCHITECTURE.md
 | 4 | Indicators | **done** |
 | 5 | Regime + signal scoring + signal engine | **done** |
 | 6 | Risk manager (sizing + circuit breakers) | **done** |
-| 7 | Liquidation protection | next |
-| 8 | Paper trading | pending |
+| 7 | Liquidation protection (tiered mmr + buffer guard) | **done** |
+| 8 | Paper trading | next |
 | 9 | Backtesting + walk-forward | pending |
 | 10 | Order execution | pending |
 | 11 | Dashboard + database | pending |
