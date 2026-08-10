@@ -25,9 +25,9 @@ PHASES = [
     ("5",  "Signal scoring",               True),
     ("6",  "Risk manager",                 True),
     ("7",  "Liquidation protection",       True),
-    ("8",  "Paper trading",                False),
+    ("8",  "Order execution",             True),
     ("9",  "Backtesting",                  False),
-    ("10", "Order execution",              False),
+    ("10", "Paper trading loop",          False),
     ("11", "Dashboard + database",         False),
     ("12", "Testing",                      False),
     ("13", "Paper trading validation",     False),
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
         print("No orders will be sent.")
 
-    print(f"\nPhases 1-7 complete. The '{args.mode}' engine arrives in a later phase; "
+    print(f"\nPhases 1-8 complete. The '{args.mode}' engine arrives in a later phase; "
           "nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0

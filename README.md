@@ -3,13 +3,15 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 7 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 8 of 14 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
-> liquidation protection.
-> The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is
-> allowed to at all*, and *whether the stop survives contact with liquidation*. It cannot act
-> on any of that: execution begins in Phase 10.
-> **Nothing in this repo can place an order.**
+> liquidation protection, order execution.
+> The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
+> to at all*, and *whether the stop survives contact with liquidation* — and it can place and
+> verify those orders, including the protective stop.
+> **By default every order goes to an in-process simulator.** Reaching the real exchange
+> still requires all three safety switches to agree; miss any one and execution stays
+> simulated.
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
 100x leverage means a 1 % adverse move against full margin is a total loss of that margin.
@@ -36,7 +38,7 @@ cp .env.example .env        # then fill in GATE_API_KEY / GATE_API_SECRET
 python main.py --status                      # config + safety gate state
 python main.py --positions                   # live account + open positions (needs API keys)
 python main.py --stats                       # performance analytics   (Phase 11)
-python main.py --mode paper                  # paper trading           (Phase 8)
+python main.py --mode paper                  # paper trading loop      (Phase 10)
 python main.py --mode backtest               # backtest + walk-forward (Phase 9)
 python main.py --mode live --confirm-live    # real orders             (Phase 14)
 ```
@@ -327,6 +329,63 @@ and the guard imports no `exchange` module.
 
 94 new tests, **648 total**, no network.
 
+## What Phase 8 added — order execution
+
+`execution/order_manager.py` and `execution/protection.py`. Everything the previous phases
+protected now gets acted on, under one invariant:
+
+> **A position may not exist without a verified stop-loss.**
+
+```
+entry filled → place SL → re-read the SL from the exchange → only then the TP ladder
+```
+
+**The re-read is the point.** A 200 on the stop POST means Gate.io accepted the request, not
+that a live trigger exists — and between "position open" and "stop confirmed" is the only
+moment this bot ever holds unprotected leveraged size. The stop is read back from
+`/price_orders` and matched by client id before anything else happens; if it cannot be
+confirmed within `sl_retry_attempts`, the position is **market-closed**. Closing at a loss is
+correct there: an unprotected 100x position is not a trade, it is an open-ended bet on the
+next candle. A test asserts the ordering against the gateway call log rather than trusting
+the code to read that way.
+
+The stop triggers on **mark price** (liquidation is priced off the mark, so a last-price stop
+races the wrong series) and is a **market order** (a stop that does not fill is not a stop).
+A backwards trigger rule would produce an order that can never fire while listing as
+protection in every audit, so the side-to-rule mapping is a named function with its own test.
+
+**An API response is not proof.** Fill, size and average price are re-read from
+`GET /orders/{id}`. `UNKNOWN` is a first-class state, deliberately distinct from `REJECTED`:
+a rejected order certainly does not exist, an unknown one might, and anything unknown counts
+as exposure. When a post-only entry times out the manager cancels and then re-reads anyway,
+because the cancel may have raced a fill.
+
+**Unfilled is a normal outcome.** Post-only entries frequently do not fill; that reports as
+`EXPIRED`, not as an error. At a 0.125 % stop a taker entry needs a 73.3 % win rate to break
+even, so not filling beats filling expensively.
+
+**Take-profits are R multiples of the *actual* stop**, so a stop capped by the liquidation
+ceiling shrinks the ladder with it. Legs floor and the runner takes the remainder, so they sum
+to exactly the position — checked for every size from 1 to 59. Break-even is padded past entry
+by the fee buffer, because moving a stop to literal entry is a small guaranteed loss rather
+than a free trade. A ratchet makes a stop that loosens *unrepresentable*: giving a losing
+trade room is how 0.25 % of risk becomes 3 %. Moving a stop places the replacement **before**
+cancelling the original, since cancel-first opens an unprotected gap exactly where the trade
+is already moving fast.
+
+**Simulation is the default, not a mode.** `OrderManager.for_config()` returns the in-process
+simulator unless the safety gate is open *and* a client was supplied — "live_enabled but
+nobody passed a client" simulates, so a wiring mistake fails toward doing nothing. Behind
+that, the Phase 2 write-guard still raises `WriteBlocked` before a socket opens, with
+`stats.requests == 0`. The simulator fills honestly: a resting post-only order fills only when
+the market trades through it, and its liquidation price uses the same formula Phase 7 checks.
+
+`countdown_cancel_all` is armed first in the sequence, so a bot that dies mid-trade leaves
+nothing resting unwatched, and `audit()` answers "is what is open right now actually
+protected?" after a restart or reconnect.
+
+64 new tests, **712 total**, no network — every one against the simulator.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -355,6 +414,7 @@ monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
             test_position_sizer.py  test_risk_manager.py  test_liquidation_guard.py
+            test_execution.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -369,9 +429,9 @@ docs/       ARCHITECTURE.md
 | 5 | Regime + signal scoring + signal engine | **done** |
 | 6 | Risk manager (sizing + circuit breakers) | **done** |
 | 7 | Liquidation protection (tiered mmr + buffer guard) | **done** |
-| 8 | Paper trading | next |
-| 9 | Backtesting + walk-forward | pending |
-| 10 | Order execution | pending |
+| 8 | Order execution + protection (`execution/`) | **done** |
+| 9 | Backtesting + walk-forward | next |
+| 10 | Paper-trading loop (wiring the layers end to end) | pending |
 | 11 | Dashboard + database | pending |
 | 12 | Testing | pending |
 | 13 | Paper trading validation | pending |

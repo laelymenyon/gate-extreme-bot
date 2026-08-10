@@ -962,7 +962,8 @@ the stop. `verify_fill()` re-checks the exchange's **own** `liq_price` and retur
 stop, reported under cross margin (`leverage=0`), or drifting from the prediction by more than
 `protection.liq_price_tolerance`.
 
-That is a **recommendation**. This module closes nothing; acting on it is Phase 10.
+That is a **recommendation**. This module closes nothing; acting on it is the execution layer
+(§15).
 
 ### Integration, and what did not change
 
@@ -988,4 +989,125 @@ Phase 6 plan integration including the re-derivation catch, and every `verify_fi
 
 **No order was sent in this phase.**
 
-**Next: PHASE 8 — paper trading.** Not started; awaiting go-ahead.
+**Next: PHASE 8 — order execution.** Complete; see §15.
+
+---
+
+## 15. PHASE 8 — order execution and protection (`execution/`)
+
+> **Phase numbering.** The original roadmap had *paper trading* at slot 8 and *order
+> execution* at slot 10. This phase implements `execution/` at slot 8 at the user's
+> direction, and the two rows are swapped: the paper-trading **loop** that wires
+> signal → risk → guard → execution end to end moves to slot 10. The ordering is the more
+> natural one anyway — a paper loop needs an execution layer to drive, and the layer
+> delivered here simulates by default, so paper execution is already what runs.
+
+Two modules. `order_manager.py` submits orders and then establishes what actually happened;
+`protection.py` enforces the invariant everything else in the repo has been protecting.
+
+### The invariant, and the window it closes
+
+> A position may not exist without a verified stop-loss.
+
+```
+entry filled -> place SL -> re-read the SL from the exchange -> only then the TP ladder
+```
+
+The re-read is the whole point. A 200 on the stop POST means Gate.io accepted the request,
+not that a live trigger exists. Between "position open" and "stop confirmed" is the only
+moment in this bot's life when leveraged size sits unprotected, and on a contract whose
+entire liquidation distance is 0.425 % that window is measured in account balances. So the
+stop is read back from `/price_orders` and matched **by client id** before anything else
+happens. If it cannot be confirmed within `protection.sl_retry_attempts`, the position is
+market-closed.
+
+Closing at a loss is the correct outcome there. An unprotected 100x position is not a trade,
+it is an open-ended bet on the next candle. `test_the_stop_is_placed_and_verified_before_any_take_profit`
+asserts the ordering against the gateway call log rather than trusting the code to read that
+way, and `test_an_unverifiable_stop_flattens_the_position` pins the escape hatch.
+
+Two details that would each silently defeat the invariant:
+
+- **The stop triggers on mark price** (`price_type=1`), because liquidation is computed off
+  the mark. A stop watching last-traded price is racing a different series than the one that
+  can liquidate it, and on a wick those disagree exactly when it matters.
+- **The stop order is a market order** (`price="0"`). A stop that does not fill is not a
+  stop. Its 0.075 % taker fee is already budgeted into every break-even figure in §5.
+
+A backwards `trigger.rule` would produce an order that can never fire while listing as
+protection in every audit, so `stop_trigger_rule()` is a named function with its own test:
+a long's stop fires at or **below** (rule 2), a short's at or above (rule 1).
+
+### An API response is not proof
+
+Every terminal fact — filled or not, how much, at what average price — is re-read with
+`GET /orders/{id}`. `OrderState.UNKNOWN` is a first-class state, deliberately distinct from
+`REJECTED`: a rejected order certainly does not exist, an unknown one might, and
+`has_exposure` counts `UNKNOWN` as size that may exist. The opposite assumption is what
+leaves an unprotected position behind.
+
+The cancel path shows why. When a post-only entry times out, the manager cancels and then
+**re-reads anyway**, because the cancel may have raced a fill. `test_an_entry_that_fills_during_the_cancel_race_is_reported_as_filled`
+pins it.
+
+**Unfilled is a normal outcome, not an error.** Entries are post-only because the maker fee
+is a rebate and fee drag decides profitability at these stop widths (§5). Post-only orders
+frequently do not fill; the manager cancels cleanly and reports `EXPIRED`. Callers must not
+treat that as a failure — at a 0.125 % stop a taker entry needs a 73.3 % win rate to break
+even, so not filling is strictly better than filling expensively.
+
+### The ladder, break-even, and the ratchet
+
+Targets are R multiples of the **actual** stop distance, so a stop capped by the liquidation
+ceiling shrinks the ladder with it and the targets stay honest multiples of what is really at
+risk. Leg sizes floor and the runner takes the remainder, so they sum to exactly the position
+— rounding the last leg up would have the exchange reject a reduce-only order for more than
+is held. `test_the_runner_takes_the_remainder_so_nothing_is_over_closed` checks every size
+from 1 to 59.
+
+Break-even is padded past entry by `protection.breakeven_fee_buffer`, because moving the stop
+to literal entry is a small guaranteed loss rather than a free trade: the round trip costs
+~0.085 % even with the maker rebate. A test asserts the configured buffer covers the real
+round-trip fee.
+
+`ratchet()` makes a stop that only ever moves toward profit **unrepresentable** rather than
+merely discouraged. Giving a losing trade room is how 0.25 % of risk becomes 3 %.
+
+Moving a stop places the replacement **before** cancelling the original. Cancel-first would
+open a gap with no protection at all, positioned exactly where the trade is already moving
+fast. If the cancel then fails, two reduce-only stops rest: the nearer triggers first and
+neither can open anything, so it is reported and tolerated rather than escalated.
+
+### Simulation is the default, not a mode
+
+`OrderManager.for_config()` returns a `SimulatedGateway` unless `Config.live_enabled` is true
+**and** a client was actually supplied. "live_enabled but nobody passed a client" simulates,
+so a wiring mistake fails toward doing nothing. Behind that, the Phase 2 write-guard raises
+`WriteBlocked` before a socket opens — `test_the_client_write_guard_is_the_second_barrier`
+confirms `stats.requests == 0` on a blocked write.
+
+The simulator fills honestly rather than generously: a resting post-only order fills only
+when the market trades through it, and its liquidation price is computed with the same
+formula Phase 7 checks, so a simulated position is auditable by the same guard as a live one.
+A simulator that fills everything would make post-only look free and flatter every result
+built on it.
+
+`countdown_cancel_all` is armed **first** in the sequence, so a bot that dies mid-trade does
+not leave resting orders behind with nobody watching them. `audit()` answers "is what is open
+right now actually protected?" for startup and post-reconnect, where the answer is genuinely
+unknown.
+
+### Tests
+
+64 new tests, **712 total**, no network. Coverage: the place-verify-then-TP ordering asserted
+on the call log, emergency close on an unverifiable stop, retry with distinct client ids,
+mark-price and market-order stop semantics, trigger rules per side, the cancel/fill race,
+`UNKNOWN` counting as exposure, partial fills in both directions, every Gate status mapping,
+ladder sizing and R maths including the capped-stop case, fee-padded break-even, the ratchet,
+new-stop-before-cancel, dead-man arming, `audit()` catching unprotected size, and the safety
+gate defaulting to simulation.
+
+**No live order was sent in this phase**: the shipped config keeps the gate shut, so every
+test ran against the in-process simulator.
+
+**Next: PHASE 9 — backtesting + walk-forward.** Not started; awaiting go-ahead.

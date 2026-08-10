@@ -527,16 +527,19 @@ def test_the_manager_cannot_place_or_close_anything():
     assert not [n for n in names if any(word in n.lower() for word in forbidden)]
 
 
-def test_execution_has_not_started():
-    """Phase 7 landed the liquidation guard; execution is still Phase 10.
+def test_the_next_phase_has_not_started():
+    """The moving boundary marker: what is built, and what is still a stub.
 
-    This is the moving boundary marker: it named Phase 7 while the guard was a stub, and
-    now names the next unimplemented layer. Nothing in the repo may place an order.
+    It named Phase 7 while the liquidation guard was a stub and Phase 8 while execution
+    was. Phase 8 landed the order layer, so it now names the backtester. Live orders still
+    require all three safety switches; the execution layer defaults to simulation.
     """
-    importlib.import_module("risk.liquidation_guard")     # Phase 7: implemented
-    for module in ("execution.order_manager", "execution.protection"):
+    for built in ("risk.liquidation_guard", "execution.order_manager",
+                  "execution.protection"):
+        importlib.import_module(built)
+    for pending in ("backtest.engine", "database.models"):
         with pytest.raises(NotImplementedError):
-            importlib.import_module(module)
+            importlib.import_module(pending)
 
 
 def test_every_refusal_names_a_breaker_and_explains_itself():
