@@ -742,4 +742,150 @@ parity for all three modules.
 **No order was sent in this phase.** No module here imports `exchange/`; there is no network path
 and no order-placing path.
 
-**Next: PHASE 6 — risk manager.** Not started; awaiting go-ahead.
+**Next: PHASE 6 — risk manager.** Complete; see §13.
+
+---
+
+## 13. PHASE 6 — position sizing and circuit breakers (`risk/`)
+
+Two modules that decide *how much* and *whether at all*. Phase 5 decides direction; this phase
+decides size and permission, and stops there. Neither module imports `exchange/` — contracts and
+risk tiers arrive as structural `Protocol`s — so there is still no network path and no
+order-placing path anywhere in the repo. `risk/liquidation_guard.py` is untouched and still
+raises `NotImplementedError("Phase 7 not implemented")`; a test pins that.
+
+```
+position_sizer.py  plan_position(...) -> PositionPlan    how many contracts, and where is the stop?
+risk_manager.py    can_trade(...)     -> RiskDecision    is trading permitted at all?
+```
+
+### The sizing invariant, and the one place it could have been broken quietly
+
+```
+size = (equity x risk.per_trade) / stop_distance,  floored to whole contracts
+```
+
+Leverage does not appear in that expression. At 20x and at 100x the same setup produces the same
+size, the same stop and the same 0.25% of equity at risk — only the locked margin differs, by
+exactly 5x. `test_leverage_changes_margin_but_not_risk` pins it.
+
+**Every rounding in this module shrinks the position.** Contracts are floored, `order_size_max`
+and the top tier's `risk_limit` cap, and the stop price is snapped *toward* entry so a rounded
+stop can never sit closer to liquidation than the ceiling allows. Size is then derived from the
+**rounded** stop rather than the ideal one, so the position is sized on the stop that will
+actually be placed.
+
+The one case that could have gone the other way is `order_size_min`. When the smallest tradable
+order would risk more than the budget, the answer is a refusal, not a round-up — rounding up
+there is a silent breach of `risk.per_trade`, which is the number every other guarantee is
+derived from. On a 50 USDT account against a 1000-contract minimum the bot simply does not trade.
+
+### The stop ceiling, and why the tier is required
+
+The widest stop that still clears liquidation by the buffer is
+`1/leverage - maintenance_rate - taker_fee - buffer` (`config.max_stop_distance`, one definition,
+shared). Reproduced by the implementation and asserted against the Phase 1 table:
+
+| contract | mmr | liq distance | stop ceiling | fee drag |
+|---|---|---|---|---|
+| BTC_USDT, ETH_USDT | 0.30 % | 0.625 % | **0.325 %** | **0.20 R** |
+| the other 29, incl. SOL, XRP | 0.50 % | 0.425 % | **0.125 %** | **0.52 R** |
+
+`plan_position` takes the tier list and **refuses when it is empty** rather than falling back to
+the contract's flat `maintenance_rate`, which is only tier 1. That field understates liquidation
+risk precisely as the position grows into a stricter tier — the trap identified in Phase 2 and
+guarded again here.
+
+Tier and size are mutually dependent: the tier is chosen by notional, notional is
+`budget / stop_distance`, and the stop is capped by the tier's maintenance rate. A short fixed
+point resolves it. The iteration is monotone — a higher tier means a higher rate, a tighter
+ceiling, a tighter stop and therefore a larger notional — so the tier index only climbs and
+settles within the length of the ladder. The tier is selected from the **pre-flooring** notional,
+which rounds the maintenance rate up rather than down;
+`test_tier_used_is_never_weaker_than_the_final_notional_requires` pins that direction.
+
+The stop itself resolves in a fixed order: ATR or structure candidate (`auto` takes the wider) →
+floor at `min_distance` → ceiling at `min(max_distance, liquidation ceiling)` with
+`on_sl_exceeds_max` deciding cap-vs-skip → snap to the price grid → **noise check**. That last
+one matters most on the mmr-0.50 % pairs: a stop below `min_sl_atr_ratio x ATR` sits inside
+ordinary bar-to-bar movement and is refused however good the score was. A structure stop with no
+confirmed pivot falls back to ATR — Phase 4's rule that a missing level is missing data, never
+evidence of open space.
+
+Sizing follows the spec's price-only formula, so `max_loss` is the 0.25 % budget. The
+**fee-inclusive** figure is reported alongside it rather than left implicit: on an mmr-0.50 %
+contract a stop-out really costs 1.52 R, not 1.00 R.
+
+### The breakers, and what each one clears on
+
+| breaker | threshold | clears |
+|---|---|---|
+| `daily_loss` | 1 % | next UTC day — "stop trading for the day" |
+| `consecutive_losses` | 3 in a row | next UTC day; a win also resets the counter |
+| `drawdown` | 3 % | **manual reset only** |
+| `max_open_positions` | 1 | not a latch — it re-opens when the position closes |
+| `cooldown` | 300 s after a loss, 60 s after a win | elapsed time |
+
+Three deliberate choices behind that table:
+
+1. **Equity is observed, not inferred from closed trades.** At 100x a drawdown arrives through
+   the mark price; a breaker that only counts settled PnL notices far too late. `can_trade`
+   evaluates the equity breakers on every call, so an open position bleeding out halts new
+   entries before anything is recorded.
+2. **The day baseline is the day's opening equity, not the high-water mark.** Otherwise
+   yesterday's loss keeps consuming today's allowance. The high-water mark, by contrast, never
+   resets on a calendar change — an account is not restored to health by midnight.
+3. **A reset re-baselines what it cleared.** Clearing the drawdown latch while the peak still
+   sits 3 % above equity re-trips it on the next observation, so the reset would be theatre and
+   the account permanently halted. Acknowledging the drawdown moves the high-water mark to
+   current equity. That is a deliberate loss of history, which is exactly why nothing in the bot
+   calls `reset()`.
+
+**The latches are persisted, not held in memory.** `SqliteRiskStore` writes them to
+`database.path` in WAL mode, creating only `risk_state` and `kill_switches` so the Phase 11 trade
+schema can share the file. The restart case is the whole point: the most tempting thing to do
+after a bad run is restart the bot, and a tripped drawdown limit must survive that. Tests cover
+restart, reset-then-restart, and a losing streak surviving a restart.
+
+**Unknown state refuses.** Missing or non-finite equity, a non-integral position count, a clock
+that has stepped backwards more than a second, a corrupt state row, an unreadable database — each
+produces a refusal naming `unknown_state`, never a default. A store that cannot be read leaves
+the manager constructible (so `--status` can explain why) and refusing everything.
+
+**No martingale, no averaging down, no revenge trading.** `risk_fraction()` takes no arguments,
+so there is nothing to scale by recent losses — the strategies are unrepresentable rather than
+merely switched off. Adding to a symbol already held is refused outright, and `RiskParams.from_config`
+rejects `risk.martingale` / `risk.averaging_down` a second time behind the config gate.
+
+### Config
+
+New validation, all fail-closed at load: the breaker ladder must be a ladder
+(`per_trade <= max_daily_loss <= max_drawdown`), cooldowns must be non-negative, and the post-loss
+cooldown must be at least the post-win one. A per-trade risk above the daily limit means the first
+stop-out of the day halts trading, so the bot could take at most one trade per day; a daily limit
+above the drawdown limit means the latch needing a human fires before the one that clears
+overnight. The same ladder is re-checked in `RiskParams.__post_init__`, because that class is also
+built directly by tests and by the backtester.
+
+### What this phase does *not* establish
+
+It does not make the bot able to trade. Nothing here places, sizes into, or manages an order —
+`plan_position` returns a number and `can_trade` returns yes or no. Acting on either is Phase 8
+onward. The margin top-up solver and the post-fill re-read of the exchange's own `liq_price`
+remain Phase 7; the ceiling computed here is a pre-trade estimate from published tier data, which
+is what deciding *whether to place* an order needs.
+
+### Tests
+
+131 new tests (56 sizing + 68 risk + 7 config), **554 total**, no network. Expectations are recomputed
+independently inside the tests — the risk formula, the fee-drag multiples, the tier maths — so a
+bug in `risk/` cannot make its own test pass. Coverage: the risk formula and its floor, rounding
+that only ever shrinks, leverage-neutrality, both tiered ceilings against the Phase 1 table,
+cap-vs-skip, the noise veto, structure-vs-ATR selection and the pivot fallback, price-grid
+rounding in both directions, backtest/live parity bar by bar, every breaker at and just below its
+threshold, the UTC rollover, cooldowns, persistence across a restart, corrupt and unreadable
+state, and the absence of any `exchange` import in either module.
+
+**No order was sent in this phase.**
+
+**Next: PHASE 7 — liquidation protection.** Not started; awaiting go-ahead.

@@ -3,10 +3,10 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 5 of 14 complete.** Environment, REST client, market-data feed, indicators,
-> regime detection, signal scoring, signal engine.
-> The bot can now decide *whether* and *which way* to trade. It cannot act on that decision:
-> sizing and risk begin in Phase 6, execution in Phase 10.
+> **Status: PHASE 6 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> regime detection, signal scoring, signal engine, position sizing, circuit breakers.
+> The bot can now decide *whether* to trade, *which way*, *how much*, and *whether it is
+> allowed to at all*. It cannot act on any of that: execution begins in Phase 10.
 > **Nothing in this repo can place an order.**
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
@@ -232,6 +232,55 @@ survive win above the ~40 % break-even rate is a Phase 9 question.
 
 97 new tests (27 regime + 42 scoring + 28 engine), **423 total**, no network.
 
+## What Phase 6 added — sizing and the circuit breakers
+
+`risk/position_sizer.py` and `risk/risk_manager.py`. Neither imports `exchange/` — contracts and
+risk tiers arrive as structural protocols — so there is still no network path and no order path.
+`risk/liquidation_guard.py` remains a Phase 7 stub, and a test pins that.
+
+**Size comes from risk, never from leverage.** `size = (equity × risk.per_trade) / stop_distance`,
+floored to whole contracts. At 20x and 100x the same setup gives the same size, the same stop and
+the same 0.25 % of equity at risk — only the locked margin differs, by exactly 5x.
+
+**Every rounding shrinks the position.** Contracts floor; `order_size_max` and the top tier's
+`risk_limit` cap; the stop price snaps *toward* entry so rounding can never move it closer to
+liquidation; and size is derived from the rounded stop, not the ideal one. The single case that
+could have gone the other way is `order_size_min` — when the smallest tradable order would risk
+more than the budget, the trade is **refused, not rounded up**, because rounding there is a silent
+breach of the one number every other guarantee rests on.
+
+**The stop ceiling comes from the tiered maintenance rate.** An empty tier list is a refusal, not
+a fallback to the contract's flat `maintenance_rate`, which is only tier 1 and understates
+liquidation risk exactly as size grows. Tier and size are mutually dependent — the tier is chosen
+by notional, notional is `budget / stop_distance`, the stop is capped by the tier's rate — so a
+short monotone fixed point resolves them, always rounding the maintenance rate up rather than down.
+The implementation reproduces the Phase 1 table exactly: 0.325 % stop and 0.20 R of fees on
+BTC/ETH, 0.125 % and 0.52 R on the other 29.
+
+**Four breakers, three different clearing rules.** Daily loss (1 %) and a 3-loss streak clear at
+the next UTC day; drawdown (3 %) needs a **manual reset**; one open position is a condition, not a
+latch. Equity is observed on every call rather than inferred from closed trades, because at 100x a
+drawdown arrives through the mark price and a breaker counting only settled PnL notices far too
+late. The day's baseline is the day's opening equity, so yesterday's loss does not eat today's
+allowance — but the high-water mark never resets on a calendar change.
+
+**A reset re-baselines what it cleared.** Clearing the drawdown latch while the peak still sits
+3 % above equity would re-trip on the next observation, halting the account forever and making the
+reset theatre. Acknowledging it moves the high-water mark to current equity — a deliberate loss of
+history, which is why nothing in the bot calls `reset()`.
+
+**The latches are persisted in SQLite (WAL), not held in memory.** The restart case is the point:
+the most tempting thing to do after a bad run is restart the bot. Tests cover restart,
+reset-then-restart, and a losing streak surviving a restart. Anything unreadable — non-finite
+equity, a backwards clock, a corrupt state row, an unopenable database — refuses with
+`unknown_state` rather than defaulting.
+
+**No martingale, no averaging down, no revenge trading.** `risk_fraction()` takes no arguments, so
+there is nothing to scale by recent losses; adding to a held symbol is refused outright; and a
+cooldown follows every trade, 300 s after a loss against 60 s after a win.
+
+131 new tests (56 sizing + 68 risk + 7 config), **554 total**, no network.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -259,6 +308,7 @@ database/   models.py
 monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
+            test_position_sizer.py  test_risk_manager.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -271,8 +321,8 @@ docs/       ARCHITECTURE.md
 | 3 | Market data + WebSocket (feed, watchdog, REST resync) | **done** |
 | 4 | Indicators | **done** |
 | 5 | Regime + signal scoring + signal engine | **done** |
-| 6 | Risk manager | next |
-| 7 | Liquidation protection | pending |
+| 6 | Risk manager (sizing + circuit breakers) | **done** |
+| 7 | Liquidation protection | next |
 | 8 | Paper trading | pending |
 | 9 | Backtesting + walk-forward | pending |
 | 10 | Order execution | pending |

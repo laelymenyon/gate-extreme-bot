@@ -327,3 +327,52 @@ def test_adx_bands_must_not_overlap(monkeypatch, tmp_path):
 def test_scoring_weights_still_sum_to_one_hundred_with_phase5_keys():
     weights = load_config().section("strategy")["scoring_weights"]
     assert sum(weights.values()) == 100
+
+
+# --- PHASE 6: the breaker ladder -------------------------------------------
+
+def test_shipped_breaker_ladder_is_ordered():
+    """Each limit must be reachable before the next, or the inner ones are decoration."""
+    cfg = load_config()
+    assert (
+        cfg.get("risk.per_trade")
+        <= cfg.get("risk.max_daily_loss")
+        <= cfg.get("risk.max_drawdown")
+    )
+    # Four consecutive stop-outs reach the daily limit; the shipped streak breaker fires
+    # at three, so it is the one that bites first.
+    assert cfg.get("risk.max_daily_loss") / cfg.get("risk.per_trade") == 4
+    assert cfg.get("risk.max_consecutive_losses") == 3
+
+
+def test_per_trade_risk_above_the_daily_limit_is_rejected(monkeypatch, tmp_path):
+    """A single stop-out that trips the day means at most one trade per day, ever."""
+    with pytest.raises(ConfigError, match="exceeds risk.max_daily_loss"):
+        _mutate(monkeypatch, tmp_path, **{"risk.per_trade": 0.02})
+
+
+def test_daily_limit_above_the_drawdown_limit_is_rejected(monkeypatch, tmp_path):
+    """The latch needing a manual reset must not fire before the one clearing overnight."""
+    with pytest.raises(ConfigError, match="exceeds risk.max_drawdown"):
+        _mutate(monkeypatch, tmp_path, **{"risk.max_daily_loss": 0.05})
+
+
+@pytest.mark.parametrize("path", [
+    "filters.cooldown_after_loss_seconds",
+    "filters.cooldown_after_win_seconds",
+])
+def test_negative_cooldowns_are_rejected(monkeypatch, tmp_path, path):
+    with pytest.raises(ConfigError, match="non-negative"):
+        _mutate(monkeypatch, tmp_path, **{path: -1})
+
+
+def test_loss_cooldown_shorter_than_the_win_cooldown_is_rejected(monkeypatch, tmp_path):
+    """The pause after a loss is what stops a losing streak being traded back."""
+    with pytest.raises(ConfigError, match="cooldown_after_loss_seconds"):
+        _mutate(monkeypatch, tmp_path, **{"filters.cooldown_after_loss_seconds": 30})
+
+
+def test_shipped_cooldowns_are_the_agreed_values():
+    cfg = load_config()
+    assert cfg.get("filters.cooldown_after_loss_seconds") == 300
+    assert cfg.get("filters.cooldown_after_win_seconds") == 60

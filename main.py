@@ -21,9 +21,9 @@ PHASES = [
     ("1",  "Environment + architecture",   True),
     ("2",  "Gate.io REST client",          True),
     ("3",  "Market data + WebSocket",      True),
-    ("4",  "Indicators",                   False),
-    ("5",  "Signal scoring",               False),
-    ("6",  "Risk manager",                 False),
+    ("4",  "Indicators",                   True),
+    ("5",  "Signal scoring",               True),
+    ("6",  "Risk manager",                 True),
     ("7",  "Liquidation protection",       False),
     ("8",  "Paper trading",                False),
     ("9",  "Backtesting",                  False),
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
         print("No orders will be sent.")
 
-    print(f"\nPhases 1-2 complete. The '{args.mode}' engine arrives in a later phase; "
+    print(f"\nPhases 1-6 complete. The '{args.mode}' engine arrives in a later phase; "
           "nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0

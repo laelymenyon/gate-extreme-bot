@@ -150,6 +150,38 @@ def _validate(cfg: Config) -> None:
     if cfg.get("risk.max_open_positions") < 1:
         raise ConfigError("risk.max_open_positions must be >= 1")
 
+    # --- PHASE 6: the breaker ladder must actually be a ladder -------------
+    # Each limit has to be reachable before the next one, or the inner limits are
+    # decoration: a per-trade risk above the daily limit means the first loss of the day
+    # trips it, and a daily limit above the drawdown limit means the account is halted for
+    # good before it is ever halted for the day.
+    per_trade = cfg.get("risk.per_trade")
+    daily = cfg.get("risk.max_daily_loss")
+    drawdown = cfg.get("risk.max_drawdown")
+    if per_trade > daily:
+        raise ConfigError(
+            f"risk.per_trade ({per_trade * 100:.2f}%) exceeds risk.max_daily_loss "
+            f"({daily * 100:.2f}%): a single stop-out would trip the daily breaker"
+        )
+    if daily > drawdown:
+        raise ConfigError(
+            f"risk.max_daily_loss ({daily * 100:.2f}%) exceeds risk.max_drawdown "
+            f"({drawdown * 100:.2f}%): the drawdown latch, which needs a manual reset, "
+            "would trip before the daily one that clears overnight"
+        )
+
+    for path in ("filters.cooldown_after_loss_seconds", "filters.cooldown_after_win_seconds"):
+        value = cfg.get(path, 0)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ConfigError(f"{path} must be a non-negative number, got {value!r}")
+    if cfg.get("filters.cooldown_after_loss_seconds", 0) < cfg.get(
+        "filters.cooldown_after_win_seconds", 0
+    ):
+        raise ConfigError(
+            "filters.cooldown_after_loss_seconds must be >= cooldown_after_win_seconds: "
+            "the pause after a loss is what prevents trading a losing streak back"
+        )
+
     # Strategies that blow up leveraged accounts are not switchable on.
     for forbidden in ("risk.martingale", "risk.averaging_down"):
         if cfg.get(forbidden, False):
