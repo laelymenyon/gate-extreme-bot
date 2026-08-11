@@ -531,6 +531,71 @@ def test_view_logs_tails_the_file(isolated_database, capsys):
     assert "line 0" not in out  # only the last 40 lines
 
 
+# --- ANSI styling (UI-only; colours must never leak into non-TTY output) ----
+
+def drive_colored(answers: list[str], *, color: bool = True, **kwargs) -> int:
+    """Run the panel with colours forced on, for tests that assert the styling."""
+    io = menu.MenuIO(input_fn=ScriptedInput(answers), color=color)
+    cfg = config_module.load_config()
+    return menu.run_menu(cfg, io=io, probe=False, **kwargs)
+
+
+def test_colors_are_disabled_when_stdout_is_not_a_tty(capsys):
+    """A piped/captured stdout must render plain text — no escape codes at all."""
+    code = drive(["0"], probe=False)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "\x1b[" not in out
+    assert "BY KANGSEBLAK" in out
+
+
+def test_colors_can_be_forced_on_and_sections_are_colored(capsys):
+    code = drive_colored(["0"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "\x1b[" in out
+    assert "BY KANGSEBLAK" in out
+    # The LOCKED STATUS badge itself is bold yellow (matched on the label so the
+    # yellow RISK & SAFETY header cannot satisfy it); section headers are colored.
+    assert "\033[1;33mSTATUS" in out
+    assert "\033[1;36mACCOUNT" in out
+    assert "\033[1;32mTRADING" in out
+    assert "\033[1;33mRISK & SAFETY" in out
+    assert "\033[1;34mSYSTEM" in out
+
+
+def test_no_color_env_wins_over_forced_colors(monkeypatch, capsys):
+    monkeypatch.setenv("NO_COLOR", "1")
+    code = drive_colored(["0"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "\x1b[" not in out
+
+
+def test_halted_status_renders_red(capsys, isolated_database):
+    """After a kill-switch trip the header badge must be bold red."""
+    code = drive_colored(["10", "t", "TRIP SEND", "", "0"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "HALTED" in out
+    # The HALTED STATUS badge itself is bold red (matched on the label so the red
+    # CREDS : EMPTY line cannot satisfy it).
+    assert "\033[1;31mSTATUS" in out
+
+
+def test_menu_renders_all_labels_verbatim(capsys):
+    """The visible option set is the contract; the labels must not drift."""
+    code = drive(["0"], probe=False)
+    out = capsys.readouterr().out
+    assert code == 0
+    for label in ("Account Balance", "Positions", "Open Orders", "Market / Ticker",
+                  "Start Live Bot", "Stop Bot", "Bot Status", "Trade History",
+                  "Risk Settings", "Kill Switch", "Emergency Flatten",
+                  "Connectivity Check", "Preflight Check", "View Logs",
+                  "Update From GitHub", "Exit"):
+        assert label in out
+
+
 # --- secrets and resilience -------------------------------------------------
 
 def test_no_menu_action_prints_secrets(monkeypatch, capsys):

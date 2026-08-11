@@ -42,6 +42,7 @@ import inspect
 import os
 import signal
 import subprocess
+import sys
 import time
 import types
 from datetime import datetime, timezone
@@ -62,20 +63,99 @@ __all__ = [
 _LOG_TAIL = 40
 _MAX_TICKERS = 31
 
+#: ANSI foreground colours (16-colour palette — the portable default on every Linux
+#: terminal, including the busybox/limited palettes found on phone SSH clients).
+_FG = {
+    "black": 30, "red": 31, "green": 32, "yellow": 33, "blue": 34,
+    "magenta": 35, "cyan": 36, "white": 37,
+    "bright_black": 90, "bright_red": 91, "bright_green": 92,
+    "bright_yellow": 93, "bright_blue": 94, "bright_magenta": 95,
+    "bright_cyan": 96, "bright_white": 97,
+}
+
+
+def _colors_enabled(print_fn: Callable[..., Any]) -> bool:
+    """Colours only when stdout is a real terminal and the user has not opted out.
+
+    ``NO_COLOR`` (the de-facto standard) disables them unconditionally; a non-TTY
+    destination (pipe, file, captured test output) renders plain text. A custom
+    ``print_fn`` is assumed to be a capture/bridge and stays plain.
+    """
+    if os.environ.get("NO_COLOR", ""):
+        return False
+    if print_fn is print:
+        try:
+            return bool(sys.stdout.isatty())
+        except (AttributeError, ValueError):
+            return False
+    return False
+
 
 class MenuIO:
-    """The panel's only I/O seam, so tests can script stdin and capture output."""
+    """The panel's only I/O seam: tests script stdin and capture output through it.
+
+    ``color`` defaults to auto-detection (TTY + no ``NO_COLOR``); pass ``True``/``False``
+    to force a choice (used by tests and by embedders).
+    """
 
     def __init__(self, input_fn: Callable[[str], str] = input,
-                 print_fn: Callable[..., Any] = print) -> None:
+                 print_fn: Callable[..., Any] = print,
+                 *, color: bool | None = None) -> None:
         self._input = input_fn
         self._print = print_fn
+        self._color = _colors_enabled(print_fn) if color is None else bool(color)
+        if os.environ.get("NO_COLOR", ""):
+            self._color = False
 
     def ask(self, prompt: str = "") -> str:
         return str(self._input(prompt))
 
     def out(self, *args: Any, **kwargs: Any) -> None:
         self._print(*args, **kwargs)
+
+    def clear_screen(self) -> str:
+        """The clear-screen control sequence, or '' when colours/controls are off.
+
+        Gated on the same capability as the colours so a piped or captured run never
+        emits terminal control codes into a file.
+        """
+        return "\033[2J\033[H" if self._color else ""
+
+    # --- ANSI styling (no-op when colours are disabled) --------------------
+
+    def paint(self, text: str, *, fg: str | None = None, bold: bool = False) -> str:
+        """Wrap ``text`` in ANSI codes; returns ``text`` unchanged when disabled."""
+        if not self._color or not text:
+            return text
+        codes: list[str] = []
+        if bold:
+            codes.append("1")
+        if fg in _FG:
+            codes.append(str(_FG[fg]))
+        if not codes:
+            return text
+        return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+    def title(self, text: str) -> str:
+        return self.paint(text, fg="cyan", bold=True)
+
+    def section(self, text: str, fg: str) -> str:
+        return self.paint(text, fg=fg, bold=True)
+
+    def number(self, text: str) -> str:
+        return self.paint(text, bold=True)
+
+    def warning(self, text: str) -> str:
+        return self.paint(text, fg="red")
+
+    def caution(self, text: str) -> str:
+        return self.paint(text, fg="yellow")
+
+    def success(self, text: str) -> str:
+        return self.paint(text, fg="green")
+
+    def subtle(self, text: str) -> str:
+        return self.paint(text, fg="bright_black")
 
 
 # --- process + connectivity introspection ---------------------------------
@@ -155,22 +235,52 @@ def _status_badge(cfg: Any, session: dict[str, Any]) -> str:
     return "LIVE-ARMED — preflight not audited (see item 13)"
 
 
-def _render_header(cfg: Any, session: dict[str, Any]) -> str:
-    creds = "present" if cfg.credentials.present else "EMPTY"
+def _status_color(cfg: Any, session: dict[str, Any]) -> str:
+    """The STATUS badge colour: red HALTED, yellow LOCKED/armed, green live-ready."""
+    if session.get("kill_switches"):
+        return "red"
+    if cfg.env_dry_run:
+        return "yellow"
+    if session.get("preflight") == "GO":
+        return "green"
+    return "yellow"  # LIVE-ARMED: preflight NO-GO or not yet audited
+
+
+def _render_header(cfg: Any, session: dict[str, Any], io: MenuIO) -> str:
+    """The framed title, the branding line, and the live safety state."""
+    inner = 46
     kill = session.get("kill_switches") or {}
     procs = session.get("processes") or []
+
+    creds = io.paint("present" if cfg.credentials.present else "EMPTY",
+                     fg="green" if cfg.credentials.present else "red", bold=True)
+    dry = io.paint(str(cfg.env_dry_run).lower().ljust(5),
+                   fg="yellow" if cfg.env_dry_run else "green")
+    preflight = session.get("preflight", "not audited")
+    preflight_color = {"GO": "green", "NO-GO": "red"}.get(preflight, "yellow")
+    api = str(session.get("connectivity", "not checked"))
+    api_color = "green" if api.startswith("OK") else \
+        ("red" if "FAILED" in api else "bright_black")
+    kill_part = io.warning(", ".join(sorted(kill))) if kill else io.subtle("none")
+    procs_part = (io.success("pid " + " ".join(str(p) for p, _ in procs)) if procs
+                  else io.subtle("not running"))
+
+    def framed(text: str) -> str:
+        return io.title(f"║{text.center(inner)}║")
+
     return "\n".join([
-        "╔══════════════════════════════════════════╗",
-        "║        GATE EXTREME BOT                  ║",
-        "║        LIVE TRADING PANEL                ║",
-        "╚══════════════════════════════════════════╝",
-        f"STATUS   : {_status_badge(cfg, session)}",
-        f"DRY_RUN  : {str(cfg.env_dry_run).lower():<5}      CREDS : {creds}",
-        f"PREFLIGHT: {session.get('preflight', 'not audited'):<22} KILL  : "
-        f"{', '.join(sorted(kill)) if kill else 'none'}",
-        f"BOT PROC : {('pid ' + ' '.join(str(p) for p, _ in procs)) if procs else 'not running':<22} "
-        f"API    : {session.get('connectivity', 'not checked')}",
-        "─" * 43,
+        io.title("╔" + "═" * inner + "╗"),
+        framed("GATE EXTREME BOT"),
+        framed("LIVE TRADING PANEL"),
+        io.paint(f"║{'BY KANGSEBLAK'.center(inner)}║", fg="bright_black"),
+        io.title("╚" + "═" * inner + "╝"),
+        io.paint(f"STATUS   : {_status_badge(cfg, session)}",
+                 fg=_status_color(cfg, session), bold=True),
+        f"DRY_RUN  : {dry}   CREDS : {creds}",
+        f"PREFLIGHT: {io.paint(preflight.ljust(18), fg=preflight_color)} KILL  : {kill_part}",
+        f"BOT PROC : {procs_part}",
+        f"API      : {io.paint(api, fg=api_color)}",
+        io.paint("─" * 48, fg="bright_black"),
     ])
 
 
@@ -179,7 +289,7 @@ def _render_header(cfg: Any, session: dict[str, Any]) -> str:
 def _pause(io: MenuIO) -> bool:
     """Wait for Enter. Returns False when the caller should exit the menu (EOF/^C)."""
     try:
-        io.ask("\n  Press Enter to return to the menu...")
+        io.ask("\n  " + io.subtle("Press Enter to return to the menu..."))
     except (EOFError, KeyboardInterrupt):
         return False
     return True
@@ -193,10 +303,10 @@ def _live_cfg() -> Any:
 
 
 def _live_denied(io: MenuIO, reason: str) -> None:
-    io.out(f"\n  refused: {reason}")
-    io.out("  All three are still required: DRY_RUN=false in .env, the panel's typed")
-    io.out("  confirmation (--confirm-live), and the live runner's own preflight GO.")
-    io.out("  No order was sent.")
+    io.out(io.warning(f"\n  refused: {reason}"))
+    io.out(io.subtle("  All three are still required: DRY_RUN=false in .env, the panel's typed"))
+    io.out(io.subtle("  confirmation (--confirm-live), and the live runner's own preflight GO."))
+    io.out(io.warning("  No order was sent."))
 
 
 def _live_barrier(io: MenuIO, cfg: Any) -> Any | None:
@@ -233,10 +343,10 @@ async def account_balance(cfg: Any, session: dict[str, Any], io: MenuIO) -> None
         try:
             account = await client.get_account()
         except GateAPIError as exc:
-            io.out(f"\n  Gate.io error: {exc}")
+            io.out(io.warning(f"\n  Gate.io error: {exc}"))
             return
         except Exception as exc:  # noqa: BLE001 — transport failures (timeout/connect)
-            io.out(f"\n  exchange read failed: {type(exc).__name__}: {exc}")
+            io.out(io.warning(f"\n  exchange read failed: {type(exc).__name__}: {exc}"))
             return
     io.out(f"\n  Total          : {account.get('total', '?')} {account.get('currency', '')}")
     io.out(f"  Available      : {account.get('available', '?')}")
@@ -260,10 +370,10 @@ async def open_orders(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
             normal = await client.list_open_orders()
             price = await client.list_price_orders()
         except GateAPIError as exc:
-            io.out(f"\n  Gate.io error: {exc}")
+            io.out(io.warning(f"\n  Gate.io error: {exc}"))
             return
         except Exception as exc:  # noqa: BLE001 — transport failures (timeout/connect)
-            io.out(f"\n  exchange read failed: {type(exc).__name__}: {exc}")
+            io.out(io.warning(f"\n  exchange read failed: {type(exc).__name__}: {exc}"))
             return
     io.out(f"\n  {len(normal)} open order(s), {len(price)} price-triggered (stops/TPs):")
     for order in normal:
@@ -286,10 +396,10 @@ async def market_ticker(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
             try:
                 ticker = await client.get_ticker(symbol)
             except GateAPIError as exc:
-                io.out(f"  {symbol:<12} unreadable [{exc.label}]")
+                io.out(io.warning(f"  {symbol:<12} unreadable [{exc.label}]"))
                 continue
             except Exception as exc:  # noqa: BLE001 — transport failures (timeout/connect)
-                io.out(f"  {symbol:<12} unreadable [{type(exc).__name__}]")
+                io.out(io.warning(f"  {symbol:<12} unreadable [{type(exc).__name__}]"))
                 continue
             io.out(f"  {symbol:<12} last={ticker.get('last', '?'):<12} "
                    f"mark={ticker.get('mark_price', '?'):<12} "
@@ -316,7 +426,7 @@ def start_live_bot(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
     io.out("  and the runner refuses to start unless preflight reports GO.")
     answer = io.ask("  Type exactly  LIVE SEND  to start (anything else aborts): ")
     if answer.strip() != "LIVE SEND":
-        io.out("\n  Aborted. No order was sent.")
+        io.out(io.warning("\n  Aborted. No order was sent."))
         return
 
     args = types.SimpleNamespace(
@@ -331,8 +441,9 @@ def start_live_bot(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
     except KeyboardInterrupt:
         io.out("\n  Stopped by Ctrl-C — the runner's shutdown already ran. Returning to menu.")
         code = 0
-    io.out(f"\n  live runner exited with code {code} "
-           f"(0=ran, 1=runtime error, 2=refused, 3=preflight NO-GO).")
+    summary = (f"\n  live runner exited with code {code} "
+               f"(0=ran, 1=runtime error, 2=refused, 3=preflight NO-GO).")
+    io.out(io.success(summary) if code == 0 else io.caution(summary))
 
 
 def stop_bot(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
@@ -350,17 +461,18 @@ def stop_bot(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
         io.out(f"    pid {pid}: {cmdline}")
     answer = io.ask("  Type exactly  STOP SEND  to send SIGINT (graceful, like Ctrl-C): ")
     if answer.strip() != "STOP SEND":
-        io.out("\n  Aborted. No signal was sent.")
+        io.out(io.warning("\n  Aborted. No signal was sent."))
         return
     for pid, _cmdline in procs:
         try:
             os.kill(pid, signal.SIGINT)
-            io.out(f"    SIGINT sent to pid {pid}. The runner disarms the dead-man switch")
-            io.out("    on stop, so a resting stop-loss remains in force.")
+            io.out(io.success(f"    SIGINT sent to pid {pid}."))
+            io.out("    The runner disarms the dead-man switch on stop, so a resting")
+            io.out("    stop-loss remains in force.")
         except ProcessLookupError:
-            io.out(f"    pid {pid} is already gone.")
+            io.out(io.caution(f"    pid {pid} is already gone."))
         except PermissionError:
-            io.out(f"    pid {pid}: permission denied — run the panel as the bot's user.")
+            io.out(io.warning(f"    pid {pid}: permission denied — run the panel as the bot's user."))
 
 
 def bot_status(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
@@ -432,7 +544,7 @@ def risk_settings(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
     io.out(f"    trades today / streak    : {state['trades_today']} / {state['consecutive_losses']}")
     tripped = state["tripped"]
     if tripped:
-        io.out("    KILL SWITCHES LATCHED:")
+        io.out(io.warning("    KILL SWITCHES LATCHED:"))
         for name, reason in sorted(tripped.items()):
             io.out(f"      {name}: {reason}")
     else:
@@ -462,23 +574,24 @@ def kill_switch(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
     if action == "t":
         answer = io.ask("  Type exactly  TRIP SEND  to latch the manual kill switch: ")
         if answer.strip() != "TRIP SEND":
-            io.out("\n  Aborted. No latch was set.")
+            io.out(io.warning("\n  Aborted. No latch was set."))
             return
         manager.trip("manual trip from the control panel", time.time())
         session["kill_switches"] = {"manual": "manual trip from the control panel"}
-        io.out("\n  The manual kill switch is LATCHED and persisted to SQLite. New entries")
-        io.out("  are blocked until a human resets it (drawdown re-baselining included).")
+        io.out(io.caution("\n  The manual kill switch is LATCHED and persisted to SQLite."))
+        io.out("  New entries are blocked until a human resets it")
+        io.out("  (drawdown re-baselining included).")
     elif action == "r":
-        io.out("\n  Resetting clears every latch and RE-BASELINES what they measured:")
+        io.out(io.caution("\n  Resetting clears every latch and RE-BASELINES what they measured:"))
         io.out("  the drawdown high-water mark moves to current equity.")
         answer = io.ask("  Type exactly  RESET SEND  to clear all latches: ")
         if answer.strip() != "RESET SEND":
-            io.out("\n  Aborted. Latches remain in force.")
+            io.out(io.warning("\n  Aborted. Latches remain in force."))
             return
         cleared = manager.reset()
         session["kill_switches"] = manager.kill_switches
         names = ", ".join(breaker.value for breaker in cleared) if cleared else "nothing to clear"
-        io.out(f"\n  Cleared: {names}.")
+        io.out(io.success(f"\n  Cleared: {names}."))
     else:
         io.out("\n  No change.")
 
@@ -499,8 +612,8 @@ async def emergency_flatten(cfg: Any, session: dict[str, Any], io: MenuIO) -> No
         # _live_barrier already explained the refusal. One extra line states why this
         # item in particular is impossible: flattening is a state change, and the
         # exchange write-guard refuses those while the gate is shut.
-        io.out("  (Flattening is a state change, refused by the exchange write-guard")
-        io.out("   while the gate is shut — the existing barrier, not a panel limitation.)")
+        io.out(io.subtle("  (Flattening is a state change, refused by the exchange write-guard"))
+        io.out(io.subtle("   while the gate is shut — the existing barrier, not a panel limitation.)"))
         return
 
     async with GateFuturesClient(live_cfg) as client:
@@ -514,7 +627,7 @@ async def emergency_flatten(cfg: Any, session: dict[str, Any], io: MenuIO) -> No
             return
         held = [p for p in raw_positions if int(p.get("size", 0) or 0) != 0]
         if not held:
-            io.out("\n  No open positions. Nothing to flatten.")
+            io.out(io.subtle("\n  No open positions. Nothing to flatten."))
             return
 
         io.out(f"\n  {len(held)} open position(s):")
@@ -525,7 +638,7 @@ async def emergency_flatten(cfg: Any, session: dict[str, Any], io: MenuIO) -> No
         answer = io.ask(f"  Type exactly  FLATTEN SEND  to market-close {len(held)} "
                         "position(s): ")
         if answer.strip() != "FLATTEN SEND":
-            io.out("\n  Aborted. Nothing was closed.")
+            io.out(io.warning("\n  Aborted. Nothing was closed."))
             return
 
         manager = OrderManager.for_config(
@@ -543,18 +656,18 @@ async def emergency_flatten(cfg: Any, session: dict[str, Any], io: MenuIO) -> No
                 io.out(f"    close: {record.summary()}")
                 remaining = await manager.position_size(symbol)
                 if remaining != 0:
-                    io.out(f"    WARNING: {remaining} contracts still open. The resting")
-                    io.out("    stop (if any) remains in force; verify the account now.")
+                    io.out(io.warning(f"    WARNING: {remaining} contracts still open. The resting"))
+                    io.out(io.warning("    stop (if any) remains in force; verify the account now."))
                 else:
                     resting = await client.list_price_orders(symbol)
                     for order in resting:
                         await client.cancel_price_order(order.get("id"))
-                    io.out(f"    flat confirmed; {len(resting)} resting protective "
-                           "order(s) cancelled.")
+                    io.out(io.success(f"    flat confirmed; {len(resting)} resting protective "
+                                      "order(s) cancelled."))
             except Exception as exc:  # noqa: BLE001 — report, never crash the panel
-                io.out(f"    flatten failed: {type(exc).__name__}: {exc}")
-                io.out("    the resting stop (if any) is left in force; verify the account.")
-        io.out("\n  Emergency flatten finished. Confirm with items 1-3.")
+                io.out(io.warning(f"    flatten failed: {type(exc).__name__}: {exc}"))
+                io.out(io.warning("    the resting stop (if any) is left in force; verify the account."))
+        io.out(io.success("\n  Emergency flatten finished. Confirm with items 1-3."))
 
 
 # --- SYSTEM ----------------------------------------------------------------
@@ -590,7 +703,7 @@ async def preflight_check(cfg: Any, session: dict[str, Any], io: MenuIO) -> None
 def view_logs(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
     path = Path(str(cfg.get("logging.file", "logs/bot.log")))
     if not path.exists():
-        io.out(f"\n  No log file at {path} yet. Runs write here once logging starts.")
+        io.out(io.subtle(f"\n  No log file at {path} yet. Runs write here once logging starts."))
         return
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     tail = lines[-_LOG_TAIL:]
@@ -625,17 +738,17 @@ def update_from_github(cfg: Any, session: dict[str, Any], io: MenuIO) -> None:
         io.out("  working tree clean")
     answer = io.ask("  Type exactly  PULL SEND  to fetch and fast-forward origin/main: ")
     if answer.strip() != "PULL SEND":
-        io.out("\n  Aborted. Nothing was pulled.")
+        io.out(io.warning("\n  Aborted. Nothing was pulled."))
         return
     result = git("pull", "--ff-only", "origin", "main")
     io.out(result.stdout)
     if result.returncode != 0:
-        io.out(f"  git pull failed ({result.returncode}):")
-        io.out(result.stderr.strip() or "  (no error text)")
-        io.out("  Nothing was changed. Run it manually to see the full error.")
+        io.out(io.warning(f"  git pull failed ({result.returncode}):"))
+        io.out(result.stderr.strip() or io.subtle("  (no error text)"))
+        io.out(io.warning("  Nothing was changed. Run it manually to see the full error."))
     else:
         new_head = git("rev-parse", "--short", "HEAD")
-        io.out(f"  updated — new HEAD: {new_head.stdout.strip()}")
+        io.out(io.success(f"  updated — new HEAD: {new_head.stdout.strip()}"))
 
 
 # --- the dispatch table ----------------------------------------------------
@@ -675,16 +788,33 @@ DISPATCH: dict[str, tuple[str, Callable[..., Any]]] = {
 }
 
 
-def _render_menu() -> str:
+#: Section-header colours: cyan read-only, green trading, yellow risk, blue system.
+_SECTION_COLORS = {
+    "ACCOUNT": "cyan", "TRADING": "green", "RISK & SAFETY": "yellow", "SYSTEM": "blue",
+}
+
+#: Per-item note colours: dim for read-only, red/yellow where the action has teeth.
+_NOTE_COLORS = {
+    "1": "bright_black", "2": "bright_black", "3": "bright_black", "4": "bright_black",
+    "5": "red", "6": "yellow", "7": "bright_black", "8": "bright_black",
+    "9": "bright_black", "10": "yellow", "11": "red",
+    "12": "bright_black", "13": "bright_black", "14": "bright_black", "15": "yellow",
+}
+
+
+def _render_menu(io: MenuIO) -> str:
     lines: list[str] = []
     for category in ("ACCOUNT", "TRADING", "RISK & SAFETY", "SYSTEM"):
-        lines.append(category)
+        lines.append("  " + io.section(category, _SECTION_COLORS[category]))
         for key, label, cat, _handler in MENU:
             if cat != category:
                 continue
             note = _NOTES.get(key, "")
-            lines.append(f"  {key:<3}{label:<22}{note}")
-    lines.append("  0   Exit")
+            note_painted = io.paint(note, fg=_NOTE_COLORS.get(key)) if note else ""
+            # Pad the plain key first, then paint, so columns line up with or without colour.
+            lines.append(f"  {io.number(f'{key:<3}')}{label:<22}{note_painted}")
+    lines.append("")
+    lines.append(f"  {io.number('0')}   Exit")
     return "\n".join(lines)
 
 
@@ -712,33 +842,33 @@ def run_menu(cfg: Any, *, symbol: str | None = None, poll_seconds: float = 5.0,
         _startup_probe(cfg, session)
 
     while True:
-        io.out("\033[2J\033[H" + _render_header(cfg, session))
-        io.out(_render_menu())
-        io.out("  Select an action by number. Press 0 to exit.")
+        io.out(io.clear_screen() + _render_header(cfg, session, io))
+        io.out(_render_menu(io))
+        io.out(io.subtle("  Select an action by number. Press 0 to exit."))
         try:
             choice = io.ask("  Choice: ").strip()
         except (EOFError, KeyboardInterrupt):
-            io.out("\n  Interrupted — goodbye. This session placed no orders.")
+            io.out(io.subtle("\n  Interrupted — goodbye. This session placed no orders."))
             return 0
         if choice == "0":
             return 0
         entry = DISPATCH.get(choice)
         if entry is None:
-            io.out(f"\n  '{choice}' is not a menu item.")
+            io.out(io.warning(f"\n  '{choice}' is not a menu item."))
             if not _pause(io):
                 return 0
             continue
 
         label, handler = entry
-        io.out(f"\n  --- {label} ---")
+        io.out(io.paint(f"\n  --- {label} ---", bold=True))
         try:
             result = handler(cfg, session, io)
             if inspect.isawaitable(result):
                 asyncio.run(result)
         except KeyboardInterrupt:
-            io.out("\n  Interrupted — the runner's shutdown already ran. Returning to menu.")
+            io.out(io.caution("\n  Interrupted — the runner's shutdown already ran. Returning to menu."))
         except Exception as exc:  # noqa: BLE001 — one failing action must not kill the panel
-            io.out(f"\n  {label} failed cleanly: {type(exc).__name__}: {exc}")
-            io.out("  No state was changed by the panel itself. See the logs for details.")
+            io.out(io.warning(f"\n  {label} failed cleanly: {type(exc).__name__}: {exc}"))
+            io.out(io.subtle("  No state was changed by the panel itself. See the logs for details."))
         if not _pause(io):
             return 0

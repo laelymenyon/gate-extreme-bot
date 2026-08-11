@@ -79,35 +79,46 @@ python main.py --menu
 ```
 
 ```
-╔══════════════════════════════════════════╗
-║        GATE EXTREME BOT                  ║
-║        LIVE TRADING PANEL                ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════════╗
+║               GATE EXTREME BOT                   ║
+║               LIVE TRADING PANEL                 ║
+║                 BY KANGSEBLAK                    ║
+╚══════════════════════════════════════════════════╝
 STATUS   : LOCKED — DRY RUN, no real orders
 DRY_RUN  : true      CREDS : EMPTY
-PREFLIGHT: not audited   KILL  : none
-BOT PROC : not running   API   : not checked
+PREFLIGHT: not audited      KILL  : none
+BOT PROC : not running
+API      : not checked (no API keys in .env)
+──────────────────────────────────────────────────
 ACCOUNT
-  1. Account Balance        read-only
-  2. Positions              read-only
-  3. Open Orders            read-only
-  4. Market / Ticker        read-only
+  1   Account Balance        read-only
+  2   Positions              read-only
+  3   Open Orders            read-only
+  4   Market / Ticker        read-only
 TRADING
-  5. Start Live Bot         REAL ORDERS — full barriers
-  6. Stop Bot               stops the live bot process
-  7. Bot Status             read-only
-  8. Trade History          read-only
+  5   Start Live Bot         REAL ORDERS — full barriers
+  6   Stop Bot               stops the live bot process
+  7   Bot Status             read-only
+  8   Trade History          read-only
 RISK & SAFETY
-  9. Risk Settings          read-only
-  10. Kill Switch           halts NEW entries (persisted latch)
-  11. Emergency Flatten     closes open positions
+  9   Risk Settings          read-only
+  10  Kill Switch            halts NEW entries (persisted latch)
+  11  Emergency Flatten      closes open positions
 SYSTEM
-  12. Connectivity Check    read-only
-  13. Preflight Check       read-only
-  14. View Logs             read-only
-  15. Update From GitHub    git pull (fast-forward only)
-  0. Exit
+  12  Connectivity Check     read-only
+  13  Preflight Check        read-only
+  14  View Logs              read-only
+  15  Update From GitHub     git pull (fast-forward only)
+
+  0   Exit
 ```
+
+The panel uses a portable 16-colour ANSI palette — bold cyan title, a STATUS badge
+(yellow LOCKED / green LIVE-READY / red HALTED / yellow LIVE-ARMED), cyan
+ACCOUNT, green TRADING, yellow RISK & SAFETY and blue SYSTEM section headers, bold
+menu numbers, red warnings/refusals and green confirmations. Colours are **auto-
+disabled** whenever stdout is not a TTY (pipes, files, captured output) or when
+`NO_COLOR` is set — no escape codes ever leak into a non-interactive run.
 
 **Read-only (10):** 1 Account Balance, 2 Positions, 3 Open Orders, 4 Market / Ticker,
 7 Bot Status, 8 Trade History, 9 Risk Settings, 12 Connectivity Check, 13 Preflight
