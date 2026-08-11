@@ -375,7 +375,12 @@ def test_positions_is_read_only_by_construction(monkeypatch, capsys):
 
 
 def test_connectivity_without_credentials_exits_two(capsys):
-    """The read-only connectivity/auth check cannot authenticate without keys."""
+    """The read-only connectivity/auth check cannot authenticate without keys.
+
+    Relies on the suite-wide hermetic fixture in conftest.py to hide the developer's
+    .env and any exported GATE_API_* variables — without it this test used to pick up
+    real credentials and try to reach the API.
+    """
     code, out = run(["--connectivity"], capsys)
     assert code == 2
     assert "GATE_API_KEY" in out

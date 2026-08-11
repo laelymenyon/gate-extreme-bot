@@ -1,6 +1,6 @@
 # PHASE 1 — Environment, Verified API Facts, Architecture
 
-Status: **PHASE 15 of 15 complete.** Phases 2-15 are documented in §§9-22 below; 1183 tests
+Status: **PHASE 15 of 15 complete.** Phases 2-15 are documented in §§9-22 below; 1235 tests
 pass and **no live order has ever been sent.** Preflight (§21) currently returns NO-GO:
 no paper or backtest history has been accumulated, so the roadmap's precondition for live
 trading is unmet. The Phase 15 live runner (§22) exists behind the audit, and is therefore
@@ -1769,7 +1769,7 @@ but locked**, and the correct state for it to be.
 ### Tests
 
 79 new tests (23 session guard + 34 live runner + 19 connectivity/verification + 4 loop
-hardening), **1183 total**, no network. The live tests use a fake client that composes the
+hardening), **1235 total**, no network. The live tests use a fake client that composes the
 Phase 8 simulator (so order mechanics stay the real implementation) and assert: shut-gate
 refusals for seven of eight switch combinations, the absent override flag, a simulated
 gateway refused, exit codes 2 and 3 before any order path, GO assembling the loop,

@@ -404,8 +404,15 @@ def load_config(run_mode: str = "paper", confirm_live: bool = False) -> Config:
 
     load_dotenv(ENV_PATH, override=False)
 
-    with CONFIG_PATH.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        # A malformed config must refuse like any other config error — the CLI catches
+        # ConfigError and exits 2. A raw YAMLError escaping here would be a traceback.
+        raise ConfigError(f"{CONFIG_PATH} is not valid YAML: {exc}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"{CONFIG_PATH} could not be read: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config.yaml did not parse to a mapping")
 

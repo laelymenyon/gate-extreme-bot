@@ -273,6 +273,8 @@ def test_market_reads_only_tickers(monkeypatch, capsys):
 
 
 def test_account_items_without_credentials_explain_rather_than_crash(capsys):
+    """Relies on the suite-wide hermetic fixture (conftest.py) to clear ambient
+    GATE_API_* variables; without it real credentials used to leak in here."""
     code = drive(["1", "", "0"], probe=False)
     assert code == 0
     assert "GATE_API_KEY/GATE_API_SECRET in .env" in capsys.readouterr().out

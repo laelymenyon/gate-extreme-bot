@@ -22,7 +22,35 @@ import socket
 
 import pytest
 
+import config as config_module
+
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite must not read the developer's own .env or ambient credentials.
+
+    The repo rule is that tests are deterministic and never load real API keys. Most
+    tests isolate individually, but that is a convention; the two places it was missed
+    (test_cli, test_menu) only failed once a real ``.env`` or exported ``GATE_API_*``
+    variables appeared in the environment — exactly what happens on the machine the
+    bot is deployed on. So the isolation is enforced here instead:
+
+    * ``config.ENV_PATH`` is pointed at a file that does not exist, so ``load_dotenv``
+      loads nothing and no test can silently pick up the repository's ``.env``.
+    * ``GATE_API_KEY`` / ``GATE_API_SECRET`` / ``DRY_RUN`` are cleared from the process
+      environment, so an exported credential cannot leak into a test that expects none.
+
+    A test that *wants* a specific value simply sets it (``monkeypatch.setenv``) or
+    points ``ENV_PATH`` at its own file — the explicit patch wins over this one.
+    """
+
+    monkeypatch.setattr(
+        config_module, "ENV_PATH", config_module.ROOT / ".env.absent"
+    )
+    for name in ("GATE_API_KEY", "GATE_API_SECRET", "DRY_RUN"):
+        monkeypatch.delenv(name, raising=False)
 
 
 class NetworkUseInTests(AssertionError):

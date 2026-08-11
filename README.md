@@ -20,7 +20,7 @@ preservation**, not for trade frequency. When no high-quality setup exists, it d
 > switch while exposed, and force-flattening synthetics before their venues close.
 > **By default every order goes to an in-process simulator.** Reaching the real exchange
 > still requires all three safety switches to agree; miss any one and execution stays
-> simulated. **1183 tests pass, and no live order has ever been sent.**
+> simulated. **1235 tests pass, and no live order has ever been sent.**
 >
 > **Preflight currently returns NO-GO, and that is the correct answer.** No paper trading
 > or backtesting history has been accumulated, so the roadmap's precondition for live
@@ -45,6 +45,115 @@ cp .env.example .env        # then fill in GATE_API_KEY / GATE_API_SECRET
 .venv/bin/python main.py --status
 .venv/bin/python -m pytest tests/ -q
 ```
+
+## Deploy on a fresh Ubuntu VPS
+
+Everything below runs as a normal user — **no root and no system installs needed**
+(beyond Python itself). Python 3.11+ is required; Ubuntu 24.04 ships 3.12.
+
+### 1. Clone
+
+```bash
+cd ~
+git clone https://github.com/laelymenyon/gate-extreme-bot.git
+cd gate-extreme-bot
+```
+
+### 2. Install dependencies (project-local venv)
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+### 3. Create `.env` with your Gate.io API keys
+
+```bash
+cp .env.example .env
+nano .env          # paste GATE_API_KEY and GATE_API_SECRET; keep DRY_RUN=true
+chmod 600 .env     # .env is gitignored — never commit it, never paste it anywhere
+```
+
+Create the API key on Gate.io with **read + futures-trade** permissions (the bot needs
+to read the account and place protected orders; a read-only key can run every check but
+cannot trade). Keep `DRY_RUN=true` until you intend real orders — see step 6.
+
+### 4. Verify read-only that everything works (places no order)
+
+```bash
+.venv/bin/python main.py --status                      # config + safety-gate state
+.venv/bin/python main.py --connectivity                # auth, balance, positions, orders, market
+.venv/bin/python main.py --preflight                   # the live-readiness audit (GO/NO-GO)
+.venv/bin/python -m pytest tests/ -q                   # the full offline test suite
+```
+
+`--connectivity` proves the keys sign correctly and reads the account, positions, open
+orders and market data. `--preflight` is read-only and reports GO/NO-GO; a NO-GO is the
+correct answer until paper/backtest history exists, and live trading stays refused.
+
+### 5. Operate the control panel (menu)
+
+The panel is interactive, so run it inside a persistent session:
+
+```bash
+tmux new -s bot
+.venv/bin/python main.py --menu
+# detach:  Ctrl-b d     re-attach:  tmux attach -t bot
+```
+
+Every item is available by number — 1-4 read the account/market, 5 starts the live bot
+(with all barriers), 6 stops it, 10 trips the kill switch, 11 emergency-flattens,
+12-13 re-run the read-only checks, 14 tails the logs, 15 pulls updates from GitHub.
+
+### 6. Go live — only when you intend real orders
+
+Live trading stays off until **all three** are true, and a typo fails safe:
+
+```bash
+# 1) edit .env:
+#    DRY_RUN=false
+# 2) in the menu (item 5), type:  LIVE SEND
+#    — the panel's stand-in for --confirm-live; anything else aborts.
+# 3) preflight must report GO; the runner re-checks it itself.
+```
+
+Equivalently from a shell (still interactive, still behind the same gates):
+
+```bash
+.venv/bin/python main.py --mode live --confirm-live
+```
+
+There is no `--force`, no silent fallback to live, and no way to place a real order
+with `DRY_RUN=true`. If you never open the gate, every order goes to the in-process
+simulator.
+
+### 7. Stop the bot
+
+```bash
+# graceful (same as Ctrl-C):
+tmux attach -t bot          # then Ctrl-C inside the panel
+# or, if started outside the menu:
+pkill -INT -f 'main.py --mode live'
+# hard stop (last resort — a hard kill leaves the dead-man switch to cancel resting
+# orders itself, which is what it is for):
+pkill -f 'main.py --mode live'
+```
+
+Stopping gracefully disarms the dead-man countdown so a verified stop-loss on an open
+position stays in force. The kill switch (menu 10) halts **new entries**; item 11
+(Emergency Flatten) closes positions.
+
+### 8. Update from GitHub
+
+```bash
+cd ~/gate-extreme-bot
+git pull --ff-only origin main      # or menu item 15 (typed PULL SEND)
+.venv/bin/python -m pip install -r requirements.txt   # if requirements changed
+```
+
+A fast-forward never touches your `.env`, `data/` or `logs/` (all gitignored), so keys
+and local state survive every update.
 
 ## Commands
 
