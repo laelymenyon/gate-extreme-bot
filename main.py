@@ -14,6 +14,7 @@ three open the runner still refuses to trade unless its own preflight reports GO
     python main.py --mode backtest
     python main.py --preflight
     python main.py --connectivity          # read-only credentials + account + market check
+    python main.py --menu                  # interactive control panel (TUI) over all of the above
     python main.py --mode live --confirm-live
     python main.py --verify-live-order --symbol BTC_USDT
                                           # FINAL barrier: one real order, protected and
@@ -77,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Read-only production check: credentials/auth, balance, positions, orders, "
              "contract, mark price, risk tiers. Never places an order",
+    )
+    parser.add_argument(
+        "--menu",
+        action="store_true",
+        help="Open the interactive control panel (TUI). Reuses every command below by "
+             "number instead of flags; every live action keeps its existing safety "
+             "barriers (DRY_RUN=false, typed confirmation, preflight GO, write-guard)",
     )
     parser.add_argument(
         "--verify-live-order",
@@ -325,6 +333,14 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+
+    if args.menu:
+        # The control panel takes over the terminal. It reuses the existing commands and
+        # runners below, keeps every safety barrier (see menu.py), and is the only mode
+        # that reads further input from the operator.
+        from menu import run_menu
+
+        return run_menu(cfg, symbol=args.symbol, poll_seconds=args.poll_seconds)
 
     if args.status or args.positions or args.stats or args.validate or args.preflight \
             or args.connectivity:

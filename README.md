@@ -55,6 +55,7 @@ python main.py --stats                       # performance analytics   (Phase 11
 python main.py --validate                    # grade paper history     (Phase 13)
 python main.py --preflight                   # live-readiness GO/NO-GO (Phase 14)
 python main.py --connectivity                # read-only creds/auth/account/market check
+python main.py --menu                        # interactive control panel — see below
 python main.py --mode paper                  # paper trading loop      (Phase 10)
 python main.py --mode backtest               # backtest + walk-forward (Phase 10 wiring)
 python main.py --mode live --confirm-live    # live runner (Phase 15) — refuses unless preflight is GO
@@ -63,6 +64,83 @@ python main.py --verify-live-order --symbol BTC_USDT
                                              # protected and closed, after typing
                                              # "BTC_USDT SEND". Never run automatically.
 ```
+
+## Interactive control panel (`--menu`)
+
+SSH into the VPS, launch the bot, and operate it by number instead of remembering
+flags. Every item delegates to an existing function or command — the panel adds no
+trading logic and removes no safety barrier. The header always shows the live state
+(`LIVE-READY` / `LIVE-ARMED` when preflight is NO-GO / `LOCKED` when `DRY_RUN=true` /
+`HALTED` when a kill switch is latched), the last account-connectivity probe, latched
+kill switches, and any running live-bot process.
+
+```bash
+python main.py --menu
+```
+
+```
+╔══════════════════════════════════════════╗
+║        GATE EXTREME BOT                  ║
+║        LIVE TRADING PANEL                ║
+╚══════════════════════════════════════════╝
+STATUS   : LOCKED — DRY RUN, no real orders
+DRY_RUN  : true      CREDS : EMPTY
+PREFLIGHT: not audited   KILL  : none
+BOT PROC : not running   API   : not checked
+ACCOUNT
+  1. Account Balance        read-only
+  2. Positions              read-only
+  3. Open Orders            read-only
+  4. Market / Ticker        read-only
+TRADING
+  5. Start Live Bot         REAL ORDERS — full barriers
+  6. Stop Bot               stops the live bot process
+  7. Bot Status             read-only
+  8. Trade History          read-only
+RISK & SAFETY
+  9. Risk Settings          read-only
+  10. Kill Switch           halts NEW entries (persisted latch)
+  11. Emergency Flatten     closes open positions
+SYSTEM
+  12. Connectivity Check    read-only
+  13. Preflight Check       read-only
+  14. View Logs             read-only
+  15. Update From GitHub    git pull (fast-forward only)
+  0. Exit
+```
+
+**Read-only (10):** 1 Account Balance, 2 Positions, 3 Open Orders, 4 Market / Ticker,
+7 Bot Status, 8 Trade History, 9 Risk Settings, 12 Connectivity Check, 13 Preflight
+Check, 14 View Logs. They only issue GET-style calls; the Phase 2 write-guard refuses
+anything else before a socket opens.
+
+**Can affect real positions (4):** 5 Start Live Bot, 6 Stop Bot, 10 Kill Switch,
+11 Emergency Flatten. Each keeps its own existing barrier:
+
+* **5 Start Live Bot** still requires `DRY_RUN=false` in `.env`, the typed phrase
+  `LIVE SEND` (the panel's `--confirm-live`), the live runner's own gate re-check, and
+  its own preflight GO over real account reads. It delegates to the existing
+  `live/loop.py` runner — nothing is reimplemented.
+* **6 Stop Bot** sends SIGINT — the same signal Ctrl-C sends — to a running
+  `main.py --mode live` process (found via `/proc`), behind a typed `STOP SEND`. The
+  runner's shutdown path disarms the dead-man switch.
+* **10 Kill Switch** trips the persisted `manual` breaker through `RiskManager`
+  (typed `TRIP SEND`), or clears latches through the existing `reset()` (typed
+  `RESET SEND`, with the re-baselining warning printed). It halts *new entries* only;
+  it never closes positions.
+* **11 Emergency Flatten** uses the existing safe close: `OrderManager.close_position`
+  (reduce-only, `close=True`), re-reads until proven flat, then cancels the symbol's
+  resting protective orders — the same sequence the live loop uses. It is refused by
+  the exchange write-guard unless the safety gate is open, so it refuses honestly when
+  `DRY_RUN=true`. Requires typed `FLATTEN SEND`.
+
+**System (1):** 15 Update From GitHub runs `git pull --ff-only origin main` behind a
+typed `PULL SEND`, after showing local HEAD and working-tree state.
+
+No menu action prints API secrets (only presence/absence is shown), and every action
+returns to the menu — a failing API read, missing log file, or git hiccup is reported
+as a line instead of crashing the panel. `Ctrl-C` at the prompt exits; `Ctrl-C` while
+the live bot runs stops the bot (gracefully) and returns to the menu.
 
 ## The safety gate
 
