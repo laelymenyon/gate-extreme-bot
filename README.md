@@ -3,24 +3,29 @@
 High-leverage Gate.io USDT-perpetual futures bot. Built for **selectivity and capital
 preservation**, not for trade frequency. When no high-quality setup exists, it does nothing.
 
-> **Status: PHASE 14 of 14 complete.** Environment, REST client, market-data feed, indicators,
+> **Status: PHASE 15 of 15 complete.** Environment, REST client, market-data feed, indicators,
 > regime detection, signal scoring, signal engine, position sizing, circuit breakers,
 > liquidation protection, order execution, backtesting, paper trading, persistence,
-> logging, analytics, a cross-layer test suite, paper-trading validation, and the
-> live-readiness audit.
+> logging, analytics, a cross-layer test suite, paper-trading validation, the
+> live-readiness audit, **and a live trading runner** (`live/loop.py`, wired to
+> `--mode live`).
 > The bot can now decide *whether* to trade, *which way*, *how much*, *whether it is allowed
 > to at all*, and *whether the stop survives contact with liquidation*; it can place and
 > verify those orders, including the protective stop; it keeps an auditable record of
 > what it did and reports the result; it can grade a paper run against explicit
-> acceptance criteria that are allowed to say no; and it can now **audit its own readiness
-> for live trading and refuse it.**
+> acceptance criteria that are allowed to say no; it can **audit its own readiness for
+> live trading and refuse it**; and it can now run the whole stack against Gate.io —
+> reading account, positions, contract metadata and candles, entering post-only, protecting
+> every fill, re-synchronising against the exchange on every step, arming the dead-man
+> switch while exposed, and force-flattening synthetics before their venues close.
 > **By default every order goes to an in-process simulator.** Reaching the real exchange
 > still requires all three safety switches to agree; miss any one and execution stays
-> simulated. **1106 tests pass, and no live order has ever been sent.**
+> simulated. **1183 tests pass, and no live order has ever been sent.**
 >
 > **Preflight currently returns NO-GO, and that is the correct answer.** No paper trading
 > or backtesting history has been accumulated, so the roadmap's precondition for live
-> trading is unmet. There is no live trading loop in this repository.
+> trading is unmet. The live runner exists but refuses to start on a NO-GO — the gate is
+> closed and the evidence requirement is unmet, in that order.
 
 **This software can lose money. No win rate or profit is claimed, promised, or implied.**
 100x leverage means a 1 % adverse move against full margin is a total loss of that margin.
@@ -49,9 +54,14 @@ python main.py --positions                   # live account + open positions (ne
 python main.py --stats                       # performance analytics   (Phase 11)
 python main.py --validate                    # grade paper history     (Phase 13)
 python main.py --preflight                   # live-readiness GO/NO-GO (Phase 14)
+python main.py --connectivity                # read-only creds/auth/account/market check
 python main.py --mode paper                  # paper trading loop      (Phase 10)
 python main.py --mode backtest               # backtest + walk-forward (Phase 10 wiring)
-python main.py --mode live --confirm-live    # readiness audit; no runner exists (Phase 14)
+python main.py --mode live --confirm-live    # live runner (Phase 15) — refuses unless preflight is GO
+python main.py --verify-live-order --symbol BTC_USDT
+                                             # FINAL barrier: one real minimum-size order,
+                                             # protected and closed, after typing
+                                             # "BTC_USDT SEND". Never run automatically.
 ```
 
 ## The safety gate
@@ -656,6 +666,72 @@ and `execution/protection.py` are unchanged by this phase.
 
 30 new tests, **1106 total**, no network and no real order.
 
+## What Phase 15 added — the live trading runner, and the last reasons it stays locked
+
+Phase 14 built the audit; this phase builds the thing the audit guards. `live/loop.py` is the
+paper stack pointed at the real exchange: the same veto chain (market data → risk breakers →
+signal → size → liquidation guard → entry → protect), but construction **requires** an open
+safety gate and a live client — the exact mirror of `PaperTrader`, which refuses both. There
+is no flag that runs it against a closed gate and no path that falls back to the simulator.
+
+**Preflight is the runner's own first act.** `run_live` re-reads account, positions and
+resting orders through the Phase 2 client, runs the Phase 14 audit on what it actually found,
+and returns exit code 3 on a NO-GO before any trader exists. Exit codes are the contract a
+supervisor reads: 0 ran, 1 runtime failure, 2 refused configuration, 3 preflight NO-GO.
+
+**The exchange is the only source of truth, read every step.** Equity is taken from the
+account, position size is re-read after every fill and on every step, the protective orders
+are re-read until verified, and the post-fill liquidation price is the exchange's own. Fills
+are recorded with `mode="live"`, so a live run can never masquerade as paper evidence to the
+Phase 13/14 audit. The dead-man switch is re-armed while any exposure is held, and the
+session calendar (`risk/session_guard.py`) — new — force-flattens non-24/7 synthetics before
+their venues close and blocks entries inside the close/open windows, so a weekend gap can no
+longer jump past a 0.125% stop.
+
+**The loop cannot lose track of a position, and cannot double-enter one it never saw.** A
+fill whose stop cannot be verified is tracked (not abandoned): the dead-man stays armed, the
+position is settled and re-protected every step until it is protected or gone, and no second
+entry is ever attempted on top of it. A position on the exchange that the loop does not
+track — opened manually, or orphaned by a previous run — blocks entries until it is gone
+(preflight refuses it at start; the loop refuses to enter on top of it mid-run). If the
+flatten misses its window, the loop keeps attempting it while the venue is closed instead of
+giving up and letting the position ride the gap. A transient read failure defers settlement
+rather than killing the loop, and an unexpected step error stops the loop the same way a
+Ctrl-C does: the dead-man countdown is disarmed on *every* stop path, so a monitored
+position never becomes a naked one 60 seconds after the bot stops.
+
+**A supervised run's testimony is now stored, not lost with the process.** Phase 13's conduct
+checks — was a position ever carried unprotected, does the ledger reconcile, did the run end
+flat — are events a trade table cannot answer, which blocked preflight forever. A watched
+paper run now persists its observed evidence to the same database (table `session_evidence`)
+and `--preflight` re-grades it on read; corrupt or version-mismatched evidence refuses rather
+than half-reads.
+
+**Two deliberate commands finish the path.** `--connectivity` proves the real credentials
+sign and the account is readable — balance, positions, open orders, contract, mark price,
+risk tiers — placing nothing. `--verify-live-order --symbol BTC_USDT` is the FINAL barrier:
+it places **one** real market order of the minimum contract size (market, deliberately, so
+the fill is guaranteed), immediately protects it with a verified stop-loss, closes it, and
+records the round trip as `mode="live"` — the complete submit → acknowledge → fill →
+protect → monitor → close → record lifecycle witnessed on the real account, only after the
+operator types `BTC_USDT SEND` at the prompt. It refuses a shut gate, empty credentials, a
+missing symbol, the simulator, a wrong confirmation, or a non-flat/unfunded/unreachable
+account, an untradable contract, an unreadable market (no order is confirmed against a
+price nobody could read), or a leverage that cannot be set — and nothing, not even the
+leverage write, happens before the typed confirmation. The post-confirmation sequence is
+exception-guarded: any failure after an order may exist routes through a recovery path
+that market-closes what is open, leaves any resting stop in force, and disarms the dead-man
+countdown so nothing is cancelled behind the operator's back — then reports exactly what it
+knows instead of claiming success. Stopping the live loop with an open position releases
+the dead-man countdown (instead of letting it cancel the resting stop-loss), so a deliberate
+stop never turns a protected position into a naked one.
+
+**The bot is LIVE EXECUTION READY BUT LOCKED.** Every layer through order placement exists and
+is tested; no code path can send a real order unless `DRY_RUN=false` **and** `--mode live`
+**and** `--confirm-live` are all deliberately set *and* preflight reports GO over real
+account reads. Today preflight is NO-GO (no paper/backtest evidence has been accumulated),
+credentials are empty, and the gate is shut.
+
 ## Core invariants
 
 1. **No position exists without a verified stop-loss.** If the SL cannot be confirmed after bounded
@@ -676,11 +752,12 @@ and `execution/protection.py` are unchanged by this phase.
 config.py  config.yaml  .env         main.py
 exchange/   gate_client.py  websocket.py
 strategy/   indicators.py  signal_engine.py  regime.py  scoring.py
-risk/       risk_manager.py  position_sizer.py  liquidation_guard.py
+risk/       risk_manager.py  position_sizer.py  liquidation_guard.py  session_guard.py
 execution/  order_manager.py  protection.py  preflight.py
 paper/      loop.py  validation.py
 backtest/   engine.py
 database/   models.py
+live/       loop.py
 monitoring/ logger.py  dashboard.py
 tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicators.py
             test_regime.py  test_scoring.py  test_signal_engine.py
@@ -688,7 +765,7 @@ tests/      test_config.py  test_gate_client.py  test_websocket.py  test_indicat
             test_execution.py  test_backtest.py  test_paper.py  test_monitoring.py
             conftest.py  test_integration.py  test_safety_audit.py
             test_invariants.py  test_regressions.py  test_cli.py  test_validation.py
-            test_preflight.py
+            test_preflight.py  test_live.py  test_session_guard.py
 docs/       ARCHITECTURE.md
 ```
 
@@ -710,12 +787,15 @@ docs/       ARCHITECTURE.md
 | 12 | Testing | **done** |
 | 13 | Paper trading validation | **done** |
 | 14 | Live readiness (audit only — no live runner) | **done** |
+| 15 | Live trading runner (`live/loop.py`, wired to `--mode live`) | **done** |
 
 Each phase must implement, pass tests, and be reviewed before the next begins. Live trading is not
 enabled until paper trading has run correctly and backtesting shows the edge is **not** merely an
 artifact of leverage.
 
-**That condition is currently unmet, and live trading is disabled.** Phase 14 delivered the
-audit that checks it (`--preflight`), not a live trading loop — no paper or backtest history
-has been accumulated, so preflight returns NO-GO. All 14 phases are complete; the bot is not
-live-capable, and no code path in this repository can send a real order.
+**That condition is currently unmet, and live trading is disabled.** Phase 15 delivered the
+runner that would execute it (`live/loop.py`), still behind the audit that checks it
+(`--preflight`) — no paper or backtest history has been accumulated, so preflight returns
+NO-GO. All 15 phases are complete; the bot is LIVE EXECUTION READY BUT LOCKED, and no code
+path in this repository can send a real order unless all three switches are open *and*
+preflight reports GO.

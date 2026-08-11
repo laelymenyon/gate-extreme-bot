@@ -1,13 +1,23 @@
 """gate-extreme-bot — CLI entry point.
 
-CLI scaffold. The strategy, risk, execution and backtest layers are built, but
-nothing is wired into a run loop yet — every run mode reports its readiness state
-and exits. No orders can be placed by this file.
+Every run mode reports its readiness state. Three of the four then stop: `--status`,
+`--backtest` and `--paper` describe what exists rather than driving it.
+
+`--mode live` is the exception, and the only path in this file that can place an order. It
+reaches the Phase 15 runner (`live/loop.py`) **only** when all three safety switches agree —
+`DRY_RUN=false` in .env, `--mode live`, and `--confirm-live`. With any switch shut this file
+prints the refusal and the readiness audit, and exits without constructing a client. With all
+three open the runner still refuses to trade unless its own preflight reports GO.
 
     python main.py --status
     python main.py --mode paper
     python main.py --mode backtest
+    python main.py --preflight
+    python main.py --connectivity          # read-only credentials + account + market check
     python main.py --mode live --confirm-live
+    python main.py --verify-live-order --symbol BTC_USDT
+                                          # FINAL barrier: one real order, protected and
+                                          # closed, after typing "BTC_USDT SEND"
 """
 
 from __future__ import annotations
@@ -15,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from typing import Any
 
 from config import ConfigError, load_config
 
@@ -33,6 +44,7 @@ PHASES = [
     ("12", "Testing",                      True),
     ("13", "Paper trading validation",      True),
     ("14", "Live readiness",                True),
+    ("15", "Live trading runner",           True),
 ]
 
 
@@ -59,6 +71,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--preflight",
         action="store_true",
         help="Audit live readiness and report GO/NO-GO. Reads only; opens nothing",
+    )
+    parser.add_argument(
+        "--connectivity",
+        action="store_true",
+        help="Read-only production check: credentials/auth, balance, positions, orders, "
+             "contract, mark price, risk tiers. Never places an order",
+    )
+    parser.add_argument(
+        "--verify-live-order",
+        action="store_true",
+        help="FINAL barrier: one explicit real market order (minimum size), immediately "
+             "protected and closed, to verify the production lifecycle. Requires all three "
+             "switches AND typing the symbol plus SEND at the prompt",
+    )
+    parser.add_argument(
+        "--symbol",
+        help="Contract to trade (default: the first symbol in universe.symbols)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        help="Run this many loop iterations, then stop (default: run until Ctrl-C)",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds between loop iterations (default: 5.0)",
     )
     return parser
 
@@ -166,12 +206,45 @@ def show_validation(cfg) -> str:
     return report.render()
 
 
-def show_preflight(cfg) -> str:
+async def read_account_snapshot(cfg) -> "AccountSnapshot | None":
+    """Read the futures account read-only through the Phase 2 client.
+
+    Returns None when credentials are absent, or an ``AccountSnapshot`` that carries the
+    failure when the read itself fails — either way the preflight report then says what
+    actually happened instead of "not read". Only GETs are issued; the write-guard refuses
+    anything else before a socket opens, so this path cannot change account state.
+    """
+    from exchange.gate_client import GateAPIError, GateFuturesClient
+    from execution.preflight import AccountSnapshot
+
+    if not cfg.credentials.present:
+        return None
+    async with GateFuturesClient(cfg) as client:
+        try:
+            account = await client.get_account()
+            positions = await client.list_positions(holding=True)
+            open_orders: list[dict] = []
+            price_orders: list[dict] = []
+            for reader, sink in ((client.list_open_orders, open_orders),
+                                 (client.list_price_orders, price_orders)):
+                try:
+                    sink.extend(await reader())
+                except GateAPIError:
+                    pass  # resting orders are a fact we try to read; absence is not proof
+            return AccountSnapshot.from_api(
+                account, positions, list(open_orders) + list(price_orders)
+            )
+        except GateAPIError as exc:
+            return AccountSnapshot.unreachable(str(exc))
+
+
+def show_preflight(cfg, account=None) -> str:
     """Audit live readiness and report GO/NO-GO.
 
-    Offline by default: the account section reports "not read" rather than reaching for
-    the network, and "not read" blocks. Passing `--positions` alongside this reads the
-    account through the Phase 2 client, whose write-guard keeps that read-only.
+    Reads only. ``--preflight`` reads the account itself through the Phase 2 client (whose
+    write-guard keeps that read-only), so the account group passes or fails on facts rather
+    than "not read" whenever credentials are present. Without credentials the section
+    reports "not read", which blocks — the same outcome as an unreadable account.
 
     This function authorises nothing. It cannot open the safety gate, and a GO still
     leaves live trading behind all three switches.
@@ -179,7 +252,69 @@ def show_preflight(cfg) -> str:
     from database.models import TradeStore
     from execution.preflight import preflight
 
-    return preflight(cfg, TradeStore.from_config(cfg)).render()
+    store = TradeStore.from_config(cfg)
+    return preflight(
+        cfg, store, account=account, validation=observed_report(store, cfg),
+    ).render()
+
+
+def observed_report(store, cfg) -> Any | None:
+    """The latest supervised paper run's re-graded report, or None when there is none.
+
+    The evidence a watched run left behind is testimony about events — whether a position
+    was ever carried unprotected, whether the ledger reconciled, whether the run ended
+    flat — that the trades table cannot answer. Preflight withholds those (which blocks)
+    unless it is handed an observed report, so the CLI hands it one. The report is
+    re-derived here from the stored evidence, never read back: a pass asserted by storage
+    would be a pass nobody checked.
+
+    Corrupt or incompatible evidence refuses rather than half-reads: a misread field would
+    become a conduct claim no run ever made, and that is exactly what preflight exists to
+    block.
+    """
+    from paper.validation import ValidationParams, stored_session, validate
+
+    try:
+        evidence = stored_session(store)
+    except ValueError as exc:
+        # Fail closed and say so. Returning None leaves preflight with nothing to clear
+        # the conduct checks with, which is a NO-GO — the same outcome as never having run
+        # a supervised session, which is the honest reading of unreadable testimony.
+        print(f"stored paper evidence is unusable: {exc}", file=sys.stderr)
+        return None
+    if evidence is None:
+        return None
+    return validate(
+        evidence, list(evidence.trades), list(evidence.curve),
+        params=ValidationParams.from_config(cfg),
+    )
+
+
+def run_live_mode(cfg, args) -> int:
+    """Delegate to the Phase 15 live runner. Only reachable with the gate open.
+
+    The closed-gate branch in :func:`main` never arrives here, so this function does not
+    re-explain the switches — it starts the loop that `live/loop.py` refuses to start on
+    its own terms if preflight is NO-GO.
+
+    The observed paper evidence is loaded and passed explicitly, exactly as `--preflight`
+    does, so the audit an operator read before typing this command is the audit the runner
+    then performs. A run whose evidence has gone missing is a NO-GO, not a silent fallback
+    to stored history — which cannot establish conduct and would block anyway.
+    """
+    from database.models import TradeStore
+    from live.loop import run_live
+
+    store = TradeStore.from_config(cfg)
+    exit_code, _report, _pf = asyncio.run(run_live(
+        cfg,
+        symbol=args.symbol,
+        steps=args.steps,
+        poll_seconds=args.poll_seconds,
+        store=store,
+        validation=observed_report(store, cfg),
+    ))
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,9 +326,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    if args.status or args.positions or args.stats or args.validate or args.preflight:
+    if args.status or args.positions or args.stats or args.validate or args.preflight \
+            or args.connectivity:
         print_status(cfg)
         exit_code = 0
+        if args.preflight:
+            # The audit reads the account itself so its account group can pass or fail on
+            # facts. Read-only: the Phase 2 write-guard refuses any state change before a
+            # socket opens, and the CLI never supplies a live-enabled config here anyway.
+            account = asyncio.run(read_account_snapshot(cfg))
+        else:
+            account = None
         if args.positions:
             exit_code = asyncio.run(show_positions(cfg))
         if args.stats:
@@ -204,23 +347,53 @@ def main(argv: list[str] | None = None) -> int:
             print(show_validation(cfg))
         if args.preflight:
             print()
-            print(show_preflight(cfg))
+            print(show_preflight(cfg, account))
+        if args.connectivity:
+            from live.verify import check_connectivity
+
+            exit_code = asyncio.run(check_connectivity(cfg, symbol=args.symbol))
         return exit_code
 
     print_status(cfg)
 
+    if args.verify_live_order:
+        # The explicit one-order verification. Behind a shut gate this is a refusal, not a
+        # run: the gate-closed branch below exists for `--mode live`, but an order command
+        # that could not possibly be allowed must say so and stop.
+        if not cfg.live_enabled:
+            print("\nLive order verification requested but the safety gate is CLOSED.")
+            print("All three are required: DRY_RUN=false in .env, --mode live, "
+                  "--confirm-live.")
+            print("No order will be sent.")
+            print()
+            print(show_preflight(cfg))
+            print("\nNo order was sent. Open all three switches to reach the verification,")
+            print("which still asks you to type the symbol and SEND before anything moves.")
+            return 0
+        from database.models import TradeStore
+        from live.verify import verify_live_order
+
+        print()
+        return asyncio.run(verify_live_order(
+            cfg, symbol=args.symbol, store=TradeStore.from_config(cfg),
+        ))
+
     if args.mode == "live":
         if not cfg.live_enabled:
+            # Unchanged from Phase 14: a refused live run explains what would satisfy it
+            # and exits 0, because "you did not open the gate" is not a program error.
             print("\nLive mode requested but the safety gate is CLOSED.")
             print("All three are required: DRY_RUN=false in .env, --mode live, --confirm-live.")
             print("No orders will be sent.")
-        # Phase 14 ships the readiness audit, not a live runner. Even with the gate open
-        # there is no code path here that places an order, and preflight reports why that
-        # is still the right state for this repository.
+            print()
+            print(show_preflight(cfg))
+            print("\nNo order was sent. Open all three switches to reach the live runner,")
+            print("which still refuses to start unless preflight reports GO.")
+            return 0
+        # The gate is open. From here the live runner owns the decision, and its own
+        # preflight is what allows or refuses the first order.
         print()
-        print(show_preflight(cfg))
-        print("\nPhase 14 provides the readiness audit only. No live trading loop exists,")
-        print("so this command cannot send an order regardless of the switches above.")
+        return run_live_mode(cfg, args)
 
     if args.mode == "paper":
         print("\nPaper trading is implemented (paper/loop.py) and Phase 13 grades a run "
@@ -233,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
               "safety gate is open, and it")
         print("only ever uses the in-process simulator.")
     else:
-        print(f"\nAll 14 phases complete. The '{args.mode}' engine is not wired to a "
+        print(f"\nAll 15 phases complete. The '{args.mode}' engine is not wired to a "
               "runner; nothing was traded.")
     print("Architecture and verified API findings: docs/ARCHITECTURE.md")
     return 0

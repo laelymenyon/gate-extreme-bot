@@ -44,6 +44,7 @@ from execution.protection import ProtectionEngine, ProtectionParams
 from risk.liquidation_guard import LiquidationParams, TierSnapshot, assess_plan
 from risk.position_sizer import SizingParams, plan_position
 from risk.risk_manager import MemoryRiskStore, RiskManager, RiskParams, RiskStore
+from risk.session_guard import SessionParams, session_verdict
 from strategy.indicators import Candles
 from strategy.signal_engine import EngineParams, SignalEngine
 
@@ -310,6 +311,7 @@ class PaperTrader:
         self.sizing = SizingParams.from_config(config)
         self.liquidation = LiquidationParams.from_config(config)
         self.protection_params = ProtectionParams.from_config(config)
+        self.session_params = SessionParams.from_config(config)
         self.engine = engine or SignalEngine(
             params=EngineParams.from_config(config)
         )
@@ -409,8 +411,23 @@ class PaperTrader:
             self.gateway.advance(price)
 
         await self._settle(now, mark)
+        session = session_verdict(self.symbol, now, self.session_params)
 
         if self._position is not None:
+            # Mirror of the live loop: flatten in the flatten window and keep trying
+            # while the venue is closed; re-protect a tracked position whose stop never
+            # verified. The rehearsal must behave like the real run.
+            if session.must_flat or session.stage == "closed":
+                await self._flatten_for_session(now)
+            elif not self._position.get("protected", True):
+                await self._reprotect()
+            return self.report
+
+        if not session.entry_allowed:
+            # Same calendar the live loop enforces: a synthetic whose venue is closed or
+            # about to close cannot carry a stop across the gap. Paper rehearses the veto
+            # so validation measures the behaviour that would actually run.
+            self.report.count(f"session:{session.stage}")
             return self.report
 
         decision = self.risk.can_trade(
@@ -519,11 +536,33 @@ class PaperTrader:
                 self.report.equity -= exit_fee
                 self.risk.record_trade(now=now, pnl=-(entry_fee + exit_fee),
                                        equity=self.report.equity)
-            else:
-                self.report.count("protection:unprotected")
+                return
+            # Mirror of the live loop: exposure with no verified stop is tracked (so it
+            # is settled, re-protected and never doubled) rather than abandoned.
+            self.report.count("protection:unprotected")
+            self._position = self._position_dict(
+                entry_price, size, per_contract, entry_fee, now, score, plan, verdict,
+                protected=False,
+            )
+            await self._flatten_for_session(
+                now, stage="protection", fill_reason="protection_failed",
+            )
             return
 
-        self._position = {
+        self._position = self._position_dict(
+            entry_price, size, per_contract, entry_fee, now, score, plan, verdict,
+            protected=True, stop_id=result.stop_order_id,
+            levels={result.stop_order_id: ("stop", plan.stop.price)}
+            | {leg.order_id: (leg.name, leg.price) for leg in result.take_profits
+               if leg.order_id},
+        )
+
+    def _position_dict(self, entry_price: float, size: int, per_contract: float,
+                       fees: float, now: float, score: float, plan: Any, verdict: Any,
+                       *, protected: bool, stop_id: str = "",
+                       levels: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The tracked-position shape, shared by the protected and unprotected paths."""
+        return {
             "direction": plan.direction,
             "entry_price": entry_price,
             "entry_time": now,
@@ -531,8 +570,8 @@ class PaperTrader:
             "remaining": abs(size),
             "per_contract": per_contract,
             "stop_price": plan.stop.price,
-            "stop_order_id": result.stop_order_id,
-            "fees": entry_fee,
+            "stop_order_id": stop_id,
+            "fees": fees,
             "realised": 0.0,
             "score": score,
             "fills": [],
@@ -542,10 +581,89 @@ class PaperTrader:
             # the trade.
             "margin": float(getattr(plan, "margin", 0.0) or 0.0),
             "liquidation_price": float(getattr(verdict, "liq_price", 0.0) or 0.0),
-            "levels": {result.stop_order_id: ("stop", plan.stop.price)}
-            | {leg.order_id: (leg.name, leg.price) for leg in result.take_profits
-               if leg.order_id},
+            "levels": dict(levels or {}),
+            "protected": protected,
         }
+
+    async def _reprotect(self) -> None:
+        """Re-attempt protection for a tracked position whose stop never verified.
+
+        Mirror of the live loop: the position stays tracked (so it is never doubled), and
+        the stop is retried every step until it verifies or the position is gone.
+        """
+        position = self._position
+        assert position is not None
+        size = abs(int(position["remaining"]))
+        if size == 0:
+            return
+        try:
+            result = await self.protection.protect(
+                self.symbol, position["direction"], position["entry_price"],
+                position["stop_price"], size, self._next_nonce(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("re-protect failed: %s", exc)
+            self.report.count("protection:reprotect_error")
+            return
+        if result.ok:
+            position["protected"] = True
+            position["stop_order_id"] = result.stop_order_id
+            position["levels"] = {
+                result.stop_order_id: ("stop", position["stop_price"])
+            } | {leg.order_id: (leg.name, leg.price) for leg in result.take_profits
+                 if leg.order_id}
+            self.report.count("protection:recovered")
+        elif result.flattened:
+            await self._flatten_for_session(
+                self.source.now(), stage="protection", fill_reason="protection_failed",
+            )
+        else:
+            self.report.count("protection:still_unprotected")
+
+    # --- session close -----------------------------------------------------
+
+    async def _flatten_for_session(self, now: float, *, stage: str = "session",
+                                   fill_reason: str = "session") -> None:
+        """Close whatever is open, mirroring the live loop's session close.
+
+        ``stage``/``fill_reason`` let the protection-failure path reuse this same
+        close-and-book sequence under its own counter and exit reason.
+        """
+        position = self._position
+        assert position is not None
+
+        record = None
+        try:
+            record = await self.orders.close_position(
+                self.symbol, self._next_nonce(), reason=f"{fill_reason} close",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("%s flatten: close failed: %s", fill_reason, exc)
+        remaining: int | None = None
+        try:
+            remaining = await self.orders.position_size(self.symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s flatten: position re-read failed: %s", fill_reason, exc)
+        if remaining != 0:
+            self.report.count(f"{stage}:close_unconfirmed")
+            return
+
+        for order_id in list(position.get("levels", {})):
+            try:
+                await self.gateway.cancel_price_order(order_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s flatten: cancelling %s failed: %s", fill_reason, order_id, exc)
+
+        price = (record.average_price if record and record.average_price
+                 else self.source.mark_price(self.symbol))
+        size = abs(int(position["remaining"]))
+        if size:
+            self._book_fill(fill_reason, price, size)
+        self._position["remaining"] = 0
+        self._close_trade(now)
+        self.report.count(f"{stage}:flattened")
+        if stage == "protection":
+            self.report.flattened += 1
 
     # --- settlement --------------------------------------------------------
 

@@ -24,6 +24,7 @@ Nothing here decides anything and nothing here places an order. It is storage.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -196,6 +197,14 @@ CREATE TABLE IF NOT EXISTS equity_curve (
     note           TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS equity_timestamp ON equity_curve (timestamp);
+CREATE TABLE IF NOT EXISTS session_evidence (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at  REAL    NOT NULL,
+    mode         TEXT    NOT NULL,
+    payload      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS session_evidence_recorded_at
+    ON session_evidence (recorded_at);
 """
 
 _TRADE_COLUMNS = (
@@ -258,6 +267,30 @@ class TradeStore:
             count += 1
         return count
 
+    def record_session_evidence(self, payload: Mapping[str, Any], *,
+                                recorded_at: float, mode: str = "paper") -> int:
+        """Append what a *watched* run witnessed. Returns the row id.
+
+        Three of Phase 13's conduct checks are events, not outcomes — whether a position was
+        ever carried unprotected, whether the ledger reconciles against the account the run
+        finished on, whether the run ended flat. The ``trades`` table records outcomes, so
+        those questions die with the process that watched them, and Phase 14 withholds them
+        (which blocks). This table is where a supervised run leaves its testimony so a later
+        process can read it.
+
+        Deliberately opaque here: this module is storage, and the payload's shape belongs to
+        :mod:`paper.validation`, which owns :class:`~paper.validation.SessionEvidence`. What
+        is stored is *evidence*, never a verdict — the checks are re-run on read, so a row
+        cannot assert a pass the criteria would not give.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO session_evidence (recorded_at, mode, payload) "
+                "VALUES (?, ?, ?)",
+                (float(recorded_at), str(mode), json.dumps(dict(payload), sort_keys=True)),
+            )
+            return int(cursor.lastrowid)
+
     def record_equity(self, point: EquityPoint) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -298,6 +331,26 @@ class TradeStore:
                 for name in _TRADE_COLUMNS
             },
         )
+
+    def latest_session_evidence(self, mode: str = "paper") -> dict[str, Any] | None:
+        """The most recently recorded session testimony, or None if no run left any.
+
+        Newest by row id rather than by ``recorded_at``: the timestamp comes from the run's
+        own clock, and a replayed session carries the clock of the data it replayed. Insert
+        order is the only thing that reliably means "most recent".
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM session_evidence WHERE mode = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (str(mode),),
+            ).fetchone()
+        if row is None:
+            return None
+        loaded = json.loads(row["payload"])
+        if not isinstance(loaded, dict):
+            raise ValueError("session_evidence payload is not an object")
+        return loaded
 
     def equity_curve(self, since: float | None = None) -> list[EquityPoint]:
         where = " WHERE timestamp >= ?" if since is not None else ""

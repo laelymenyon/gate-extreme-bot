@@ -39,7 +39,7 @@ decision and a human's, and a green report here is an input to it, not a substit
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
@@ -50,13 +50,28 @@ from monitoring.dashboard import Performance, compute
 __all__ = [
     "CheckStatus",
     "Check",
+    "EVIDENCE_FORMAT",
     "ValidationParams",
     "SessionEvidence",
     "ValidationReport",
     "record_session",
     "run_session",
+    "stored_session",
     "validate",
 ]
+
+#: Bumped when the stored evidence payload changes meaning. An unrecognised format is
+#: refused rather than guessed at: a misread field here would be a conduct claim nobody
+#: made.
+EVIDENCE_FORMAT = 1
+
+#: The scalar facts a watched run attests to. Trades and the curve are handled separately
+#: because they are records rather than scalars.
+_EVIDENCE_FIELDS = (
+    "symbol", "steps", "starting_equity", "equity", "simulated", "live_gate_open",
+    "entries_attempted", "entries_filled", "entries_expired", "protection_failures",
+    "flattened", "unprotected", "open_at_end",
+)
 
 
 class CheckStatus(str, Enum):
@@ -217,6 +232,76 @@ class SessionEvidence:
     def net_pnl(self) -> float:
         return self.equity - self.starting_equity
 
+    def to_payload(self, *, leverage: int = 100, mode: str = "paper") -> dict[str, Any]:
+        """Serialise what this run witnessed, so a later process can grade it.
+
+        Trades are converted to :class:`~database.models.TradeRecord` — the audit-trail
+        shape — and carried *with* the evidence rather than left to be re-read from the
+        trades table. Reconciliation compares one session's closing equity against the
+        trades that session booked, and a table holding several runs would sum all of them
+        against one run's equity move.
+
+        Only the facts are stored. No check result and no verdict is written, so a restored
+        session is re-graded against the current criteria on every read.
+        """
+        trades = []
+        for trade in self.trades:
+            record = (
+                trade if isinstance(trade, TradeRecord)
+                else TradeRecord.from_paper(trade, leverage=leverage, mode=mode)
+            )
+            row = asdict(record)
+            row.pop("id", None)
+            trades.append(row)
+        return {
+            "format": EVIDENCE_FORMAT,
+            "observed": bool(self.observed),
+            **{name: getattr(self, name) for name in _EVIDENCE_FIELDS},
+            "rejections": dict(self.rejections),
+            "trades": trades,
+            "curve": [asdict(point) for point in self.curve],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "SessionEvidence":
+        """Rebuild a witnessed session. Raises ``ValueError`` on anything unrecognised.
+
+        Fail-closed on the format: a payload this code does not understand is refused rather
+        than partially read, because a field that silently defaulted would become a conduct
+        claim that no run actually made.
+        """
+        version = payload.get("format")
+        if version != EVIDENCE_FORMAT:
+            raise ValueError(
+                f"session evidence format {version!r} is not the expected "
+                f"{EVIDENCE_FORMAT}; it was written by a different version of this bot "
+                "and will not be guessed at"
+            )
+        scalars = {}
+        for name in _EVIDENCE_FIELDS:
+            if name not in payload:
+                raise ValueError(f"session evidence is missing {name!r}")
+            scalars[name] = payload[name]
+        return cls(
+            symbol=str(scalars["symbol"]),
+            steps=int(scalars["steps"]),
+            starting_equity=float(scalars["starting_equity"]),
+            equity=float(scalars["equity"]),
+            simulated=bool(scalars["simulated"]),
+            live_gate_open=bool(scalars["live_gate_open"]),
+            entries_attempted=int(scalars["entries_attempted"]),
+            entries_filled=int(scalars["entries_filled"]),
+            entries_expired=int(scalars["entries_expired"]),
+            protection_failures=int(scalars["protection_failures"]),
+            flattened=int(scalars["flattened"]),
+            unprotected=int(scalars["unprotected"]),
+            open_at_end=bool(scalars["open_at_end"]),
+            trades=tuple(TradeRecord(**row) for row in payload.get("trades", ())),
+            curve=tuple(EquityPoint(**row) for row in payload.get("curve", ())),
+            rejections=dict(payload.get("rejections", {})),
+            observed=bool(payload["observed"]),
+        )
+
 
 def record_session(store: TradeStore, evidence: SessionEvidence, *, leverage: int,
                    mode: str = "paper", regime: str = "") -> int:
@@ -240,12 +325,20 @@ def record_session(store: TradeStore, evidence: SessionEvidence, *, leverage: in
 
 async def run_session(trader: Any, *, steps: int | None = None,
                       store: TradeStore | None = None, leverage: int = 100,
-                      mode: str = "paper", snapshot_stride: int = 1) -> SessionEvidence:
+                      mode: str = "paper", snapshot_stride: int = 1,
+                      evidence_path: str | None = None) -> SessionEvidence:
     """Drive a paper run, sampling equity as it goes, and optionally persist it.
 
     Sampling happens through :meth:`~paper.loop.PaperTrader.run`'s ``on_step`` hook rather
     than in a second loop of our own, so the run being measured is the run that would have
     happened anyway — the source advances exactly once per step either way.
+
+    ``evidence_path`` optionally points at a ``TradeStore`` (typically ``database.path``)
+    for the observed evidence: a supervised run's testimony is an event, and events die
+    with the process unless they are written down. The store used for ``store`` is not
+    assumed — a run may want its trades persisted and its testimony separate, and storing
+    the testimony in the same file as the trades is the default that keeps both beside
+    what they describe.
     """
     if snapshot_stride < 1:
         raise ValueError("snapshot_stride must be >= 1")
@@ -271,7 +364,30 @@ async def run_session(trader: Any, *, steps: int | None = None,
     evidence = SessionEvidence.of(trader, curve)
     if store is not None:
         record_session(store, evidence, leverage=leverage, mode=mode)
+    if evidence_path is not None:
+        # The run's own last observed instant, not the wall clock: a replayed session is
+        # timestamped by the data it replayed, and ordering reads by row id (which
+        # `latest_session_evidence` does) is what makes "most recent" mean insertion order
+        # regardless.
+        recorded_at = (
+            curve[-1].timestamp if curve
+            else float(getattr(trader.source, "now", lambda: 0.0)())
+        )
+        TradeStore(evidence_path).record_session_evidence(
+            evidence.to_payload(leverage=leverage, mode=mode),
+            recorded_at=recorded_at, mode=mode,
+        )
     return evidence
+
+
+def stored_session(store: TradeStore, *, mode: str = "paper") -> SessionEvidence | None:
+    """The most recently recorded witnessed session, or None when none exists.
+
+    Raises ``ValueError`` if the stored payload is corrupt or was written by an
+    incompatible version — a misread testimony must refuse, not become a conduct claim.
+    """
+    payload = store.latest_session_evidence(mode=mode)
+    return SessionEvidence.from_payload(payload) if payload is not None else None
 
 
 # --- the criteria -----------------------------------------------------------

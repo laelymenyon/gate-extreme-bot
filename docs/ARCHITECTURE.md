@@ -1,9 +1,11 @@
 # PHASE 1 — Environment, Verified API Facts, Architecture
 
-Status: **PHASE 14 of 14 complete.** Phases 2-14 are documented in §§9-21 below; 1106 tests
+Status: **PHASE 15 of 15 complete.** Phases 2-15 are documented in §§9-22 below; 1183 tests
 pass and **no live order has ever been sent.** Preflight (§21) currently returns NO-GO:
 no paper or backtest history has been accumulated, so the roadmap's precondition for live
-trading is unmet, and no live trading loop exists in this repository.
+trading is unmet. The Phase 15 live runner (§22) exists behind the audit, and is therefore
+live-execution-ready but locked: no code path can send a real order unless all three
+switches are open *and* preflight reports GO.
 All numbers below were pulled live from Gate.io on 2026-08-09, not from memory.
 
 ---
@@ -228,6 +230,7 @@ gap jumps straight past a 0.125 % stop, so the loss is bounded by *liquidation*,
 and risk-per-trade does not hold across a gap. `session_guard` therefore force-flattens synthetics
 30 min before close, blocks entries 60 min before close and 15 min after open, and
 **fails closed when the session calendar is unavailable** (validation enforces this).
+Implemented in Phase 15 as `risk/session_guard.py`, enforced by both trading loops — see §22.
 
 ---
 
@@ -1674,4 +1677,110 @@ condition removed in turn still refusing, and the three no-authority properties.
 Both load-bearing guards were mutation-checked: relaxing `ready` to ignore `INSUFFICIENT`
 fails 4 tests, and dropping the backtest-edge condition fails 2. Both mutants were reverted.
 
-**No real order was sent in this phase, and none can be: no live runner exists.**
+**No real order was sent in this phase, and none could be: Phase 14 shipped no live runner.**
+The runner landed in §22.
+
+---
+
+## 22. PHASE 15 — the live trading runner (`live/loop.py`)
+
+Phase 14 built the audit; this phase builds the thing the audit guards. `live/loop.py` is the
+paper stack pointed at the real exchange — the same veto chain (market data → risk breakers →
+signal → size → liquidation guard → entry → protect) — with the differences that matter:
+
+* **Construction requires an open gate and a live client.** `LiveTrader` refuses to exist
+  while the gate is shut and refuses a `SimulatedGateway` by name; `PaperTrader` refuses the
+  exact mirror image. Seven of eight switch combinations produce no trader, and no override
+  flag exists (asserted against the constructor's signature).
+* **The exchange is read on every step.** Equity comes from `GET /accounts`, position size is
+  re-read after every fill and before every decision, the stop is re-read from `/price_orders`
+  until verified, and fills are recorded `mode="live"` so they can never be mistaken for paper
+  evidence by the Phase 13/14 audit. The dead-man switch is re-armed on every step while any
+  exposure is held.
+* **The loop cannot lose or double a position.** A fill whose stop cannot be verified is
+  *tracked* with `protected=False` — the dead-man stays armed, settlement keeps watching it,
+  and `_reprotect` re-attempts the stop every step until it verifies or the position is gone;
+  no second entry is ever attempted on top of it. A position on the exchange the loop does
+  not track (manual, or orphaned by a previous run) blocks entries until it is gone. If the
+  pre-close flatten fails, the loop keeps attempting it while the venue is closed instead of
+  giving up and riding the gap. Transient settlement reads defer to the next step rather than
+  killing the loop, and the dead-man countdown is disarmed on **every** stop path — Ctrl-C,
+  completed steps, or an unexpected error — so a monitored position never becomes a naked one
+  60 seconds after the bot stops.
+* **Preflight is the runner's first act.** `run_live` re-reads account, positions and resting
+  orders, runs the Phase 14 audit on what it actually found, and exits 3 on NO-GO before any
+  trader exists. Exit codes are the supervisor's contract: 0 ran, 1 runtime failure, 2 refused
+  configuration, 3 preflight NO-GO.
+* **Session-gap risk is now enforced.** `risk/session_guard.py` is the calendar §4 promised:
+  only BTC/ETH/SOL/XRP are 24/7; every other configured symbol has conservative
+  DST-intersection windows (deliberately narrower than the venue's, so the guard fails toward
+  closed). Unknown symbols are CLOSED — validation already demands
+  `treat_unknown_session_as_closed=true`. Both loops veto entries 60 min before a close and
+  15 min after an open, and force-flatten 30 min before a close, cancelling the resting
+  protective orders afterwards so a stale reduce-only order cannot fire into a later session.
+  The backtester does not apply the calendar: replay history is itself the truth about what
+  was tradable.
+* **A supervised run's testimony survives the process.** Phase 13's conduct checks are events
+  (was a position ever unprotected, does the ledger reconcile, did the run end flat) that a
+  trade table cannot answer — which previously blocked preflight forever. A watched paper run
+  now persists its observed evidence (`table session_evidence`, payload format-versioned,
+  re-graded on every read, corrupt/foreign versions refused) and `--preflight` hands the
+  re-graded report to the audit, so the intended path to GO is executable instead of
+  theoretical.
+* **`--preflight` reads the account.** The CLI's audit now performs its own read-only account
+  snapshot (the Phase 2 write-guard keeps it read-only), so the account group passes or fails
+  on facts whenever credentials are present.
+
+### Connectivity and the FINAL verification barrier
+
+Two commands in `live/verify.py` complete the operator's path to a first real order:
+
+* `--connectivity` — read-only proof that the credentials sign and the account is readable:
+  signed account read, balance, positions, open orders, contract metadata, mark/last price,
+  risk tiers. A rejected key is reported as `INVALID_KEY`/`INVALID_SIGNATURE` with guidance;
+  nothing is claimed that was not read, and nothing is written. Exit 2 without credentials.
+* `--verify-live-order --symbol X` — the FINAL barrier before the strategy loop is trusted
+  with the account. One real **market** order of the minimum contract size (market rather
+  than the strategy's post-only, so the fill is guaranteed and the whole lifecycle is
+  witnessed in a single round trip), immediately protected by a verified stop-loss, then
+  closed and recorded `mode="live"`. It requires all three switches **and** the account to
+  be flat, funded and reachable **and** kill-switches clear **and** the contract tradable
+  **and** the market readable **and** the operator to type `X SEND` at the prompt. Nothing —
+  not even the `set_leverage` write — happens before that typed confirmation; leverage is set
+  to the configured value immediately after, so the margin the order rests on is the margin
+  the operator was shown. It refuses a `SimulatedGateway` by name. The post-confirmation
+  sequence is exception-guarded: any failure after an order may exist routes through
+  `_recover`, which market-closes what is open, **leaves any resting stop in force** (the
+  stop is the only protection if the close keeps failing), disarms the dead-man countdown so
+  nothing is cancelled behind the operator's back, and only then reports. Exit codes: 0 full
+  lifecycle verified, 1 a step failed (account recovered or provably still protected),
+  2 refused before anything moved (gate, credentials, symbol, confirmation, leverage),
+  3 account conditions unmet (including an unreadable market).
+
+### The live loop cannot trade accidentally
+
+A real order requires: `DRY_RUN=false` (`.env`) **and** `--mode live` **and** `--confirm-live`
+(all checked by `config.py` at load) **and** preflight GO over a real account read (checked by
+`run_live` before the trader exists). The write-guard in `exchange/gate_client.py` is a second
+independent barrier behind the config gate. Today credentials are empty, the database holds no
+paper or backtest evidence, and the gate is shut — so the repository is **live-execution-ready
+but locked**, and the correct state for it to be.
+
+### Tests
+
+79 new tests (23 session guard + 34 live runner + 19 connectivity/verification + 4 loop
+hardening), **1183 total**, no network. The live tests use a fake client that composes the
+Phase 8 simulator (so order mechanics stay the real implementation) and assert: shut-gate
+refusals for seven of eight switch combinations, the absent override flag, a simulated
+gateway refused, exit codes 2 and 3 before any order path, GO assembling the loop,
+exchange-sourced equity, the veto chain (no signal, latched breaker, failed leverage,
+unfilled entry as `expired`), live-mode-only persistence, every filled entry protected, the
+dead-man switch re-armed while exposed, the session calendar enforced in both loops (entry
+veto and pre-close flatten with protective-order removal), and the hardened failure paths:
+the countdown released on an *error* stop too (not only Ctrl-C), an unprotected live position
+tracked with no second entry, an untracked exchange position blocking entries, the flatten
+still attempted after the venue closes, the verification recovery path after a post-entry
+exception, and the pre-confirmation refusals (unreadable market, unsettable leverage).
+
+**No live order has ever been sent.** The runner is the first code in the repository that
+*could* send one, and it is the most refused code in the repository by design.

@@ -177,9 +177,9 @@ def test_positions_without_credentials_exits_two(monkeypatch, capsys):
 
 # --- the phase table --------------------------------------------------------
 
-def test_the_phase_table_covers_all_fourteen_phases():
+def test_the_phase_table_covers_all_fifteen_phases():
     numbers = [number for number, _, _ in main.PHASES]
-    assert numbers == [str(n) for n in range(1, 15)]
+    assert numbers == [str(n) for n in range(1, 16)]
 
 
 def test_the_phase_table_matches_the_roadmap_in_the_readme():
@@ -318,7 +318,8 @@ def test_no_cli_invocation_can_reach_an_order_path(monkeypatch, capsys):
 
     for argv in ([], ["--status"], ["--stats"], ["--mode", "paper"],
                  ["--mode", "backtest"], ["--mode", "live"],
-                 ["--mode", "live", "--confirm-live"]):
+                 ["--mode", "live", "--confirm-live"],
+                 ["--mode", "live", "--confirm-live", "--verify-live-order"]):
         code, _ = run(list(argv), capsys)
         assert code == 0, f"{argv} exited {code}"
 
@@ -371,6 +372,94 @@ def test_positions_is_read_only_by_construction(monkeypatch, capsys):
     assert code == 0
     assert calls == ["get_account", "list_positions"]
     assert "No open positions." in out
+
+
+def test_connectivity_without_credentials_exits_two(capsys):
+    """The read-only connectivity/auth check cannot authenticate without keys."""
+    code, out = run(["--connectivity"], capsys)
+    assert code == 2
+    assert "GATE_API_KEY" in out
+
+
+def test_connectivity_never_places_an_order(monkeypatch, capsys):
+    """`--connectivity` is read-only by construction: only GET-style calls are allowed."""
+    monkeypatch.setattr(config_module, "ENV_PATH", config_module.ROOT / ".env.absent")
+    monkeypatch.setenv("GATE_API_KEY", "k" * 24)
+    monkeypatch.setenv("GATE_API_SECRET", "s" * 24)
+
+    calls: list[str] = []
+
+    class ReadOnlyClient:
+        def __init__(self, cfg, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get_account(self):
+            calls.append("get_account")
+            return {"total": "10000", "currency": "USDT", "available": "9993"}
+
+        async def list_positions(self, holding=True):
+            calls.append("list_positions")
+            return []
+
+        async def list_open_orders(self):
+            calls.append("list_open_orders")
+            return []
+
+        async def list_price_orders(self):
+            calls.append("list_price_orders")
+            return []
+
+        async def get_contract(self, symbol, refresh=False):
+            calls.append("get_contract")
+            return {"name": symbol, "status": "trading", "leverage_max": "200",
+                    "quanto_multiplier": "0.0001", "order_size_min": 1,
+                    "maintenance_rate": "0.003", "taker_fee_rate": "0.00075",
+                    "maker_fee_rate": "-0.0001", "leverage_min": "1",
+                    "order_size_max": "12000000", "order_price_round": "0.1",
+                    "mark_price_round": "0.01", "risk_limit_base": "500000",
+                    "in_delisting": False}
+
+        async def get_ticker(self, symbol):
+            calls.append("get_ticker")
+            return {"last": "65000", "mark_price": "65000"}
+
+        async def get_risk_tiers(self, symbol, refresh=False):
+            calls.append("get_risk_tiers")
+            return [{"tier": 1, "risk_limit": "500000", "initial_rate": "0.005",
+                     "maintenance_rate": "0.003", "leverage_max": "200",
+                     "deduction": "0"}]
+
+        def __getattr__(self, name):
+            raise AssertionError(f"--connectivity called client.{name}")
+
+    monkeypatch.setattr("exchange.gate_client.GateFuturesClient", ReadOnlyClient)
+    code, out = run(["--connectivity"], capsys)
+
+    assert code == 0
+    assert calls == ["get_account", "list_positions", "list_open_orders",
+                     "list_price_orders", "get_contract", "get_ticker",
+                     "get_risk_tiers"]
+    assert "auth          : OK" in out
+
+
+def test_verify_live_order_is_refused_behind_a_shut_gate(monkeypatch, capsys):
+    """An accidental invocation of the order-verification command places nothing."""
+    class ExplodingClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("the CLI constructed a live client behind a shut gate")
+
+    monkeypatch.setattr("exchange.gate_client.GateFuturesClient", ExplodingClient)
+    code, out = run(["--mode", "live", "--confirm-live", "--verify-live-order"], capsys)
+
+    assert code == 0
+    assert "safety gate is CLOSED" in out
+    assert "No order was sent" in out
 
 
 def test_positions_reports_an_api_error_without_crashing(monkeypatch, capsys):
